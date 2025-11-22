@@ -74,6 +74,7 @@ class CompilationArtifact(ABC):
         )  # List of ancestor artifacts that depend on this artifact
         for dependency in self.depends:
             dependency.users.append(self)
+        self.fake_available = False
 
     def __repr__(self):
         return f"{self.__class__.__name__}(path={self.path}, depends={self.depends})"
@@ -87,6 +88,8 @@ class CompilationArtifact(ABC):
         CompilationArtifact._instances[abs_path] = self
 
     def is_available(self):
+        if self.fake_available:
+            return True
         if not self.path.exists():
             return False
         for dependency in self.depends:
@@ -157,6 +160,8 @@ class PythonGeneratedMLIRArtifact(CompilationArtifact):
         super().__init__(path)
 
     def is_available(self):
+        if self.fake_available:
+            return True
         is_available = super().is_available()
         if is_available:
             # Force regeneration if the Python source is changed
@@ -171,6 +176,9 @@ class PythonGeneratedMLIRArtifact(CompilationArtifact):
 
 
 class CompilationRule(ABC):
+    def __init__(self, dry_run=None):
+        self.dry_run = dry_run
+
     @abstractmethod
     def matches(self, artifact: list[CompilationArtifact]) -> bool:
         pass
@@ -219,14 +227,32 @@ class GenerateMLIRFromPythonCompilationRule(CompilationRule):
                 else:
                     mlir_code = str(mlir_code)
 
-            with open(artifact.path, "w") as f:
-                f.write(mlir_code)
+            if self.dry_run is None:
+                with open(artifact.path, "w") as f:
+                    f.write(mlir_code)
 
             # Now that the artifact is generated, replace this artifact with the MLIR source code file
             old_users = artifact.delete()
             new_artifact = SourceArtifact.new(artifact.path)
             for user in old_users:
                 user.depends.append(new_artifact)
+            if self.dry_run is None:
+                python_cmd = ""
+                # Import the Python source file
+                python_cmd += 'import sys; sys.path.append('f'"{Path(artifact.import_path).parent}"''); '
+                python_cmd += f'from {Path(artifact.import_path).stem} import {artifact.callback_fn}; '
+                if artifact.requires_context:
+                    python_cmd += "from aie.extras.context import mlir_mod_ctx; "
+                    python_cmd += "with mlir_mod_ctx() as ctx: "
+                python_cmd += f"mlir_code = {artifact.callback_fn}({', '.join(map(repr, artifact.callback_args))}, {', '.join(f'{k}={repr(v)}' for k, v in artifact.callback_kwargs.items())}); "
+                if artifact.requires_context:
+                    python_cmd += "print(str(ctx.module))"
+                else:
+                    python_cmd += "print(str(mlir_code))"
+                self.dry_run.append(
+                    f"python3 -c '{python_cmd}' > {artifact.path}"
+                )
+                new_artifact.fake_available = True
             artifacts[i] = new_artifact
             logging.debug(f"Created MLIR source string for {artifact.path.name}")
 
@@ -316,29 +342,40 @@ class AieccCompilationRule(CompilationRule):
 
             env = os.environ.copy()
             logging.debug(f"Compiling MLIR with command: {' '.join(compile_cmd)}")
-            result = subprocess.run(
-                compile_cmd,
-                cwd=str(self.build_dir),
-                capture_output=True,
-                text=True,
-                timeout=300,
-                env=env,
-            )
-            if result.returncode == 0:
-                logging.debug(
-                    f"Successfully compiled {mlir_source.path} to {', '.join([str(first_xclbin.path)] if do_compile_xclbin else [] + [str(first_insts_bin.path)] if do_compile_insts_bin else [])}"
+            if not self.dry_run:
+                result = subprocess.run(
+                    compile_cmd,
+                    cwd=str(self.build_dir),
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                    env=env,
                 )
-            else:
-                raise RuntimeError(
-                    f"MLIR compilation for {mlir_source.path} failed: {result.stderr}"
-                )
+                if result.returncode == 0:
+                    logging.debug(
+                        f"Successfully compiled {mlir_source.path} to {', '.join([str(first_xclbin.path)] if do_compile_xclbin else [] + [str(first_insts_bin.path)] if do_compile_insts_bin else [])}"
+                    )
+                else:
+                    raise RuntimeError(
+                        f"MLIR compilation for {mlir_source.path} failed: {result.stderr}"
+                    )
 
-            # There may be multiple targets that require an xclbin/insts.bin from the same MLIR with different names; copy them
-            for sources_to in [mlir_sources_to_xclbins, mlir_sources_to_insts_bins]:
-                if sources_to.get(mlir_source, [])[1:]:
-                    copy_src = sources_to[mlir_source][0]
-                    for copy_dest in sources_to[mlir_source][1:]:
-                        shutil.copy(copy_src.path, copy_dest.path)
+                # There may be multiple targets that require an xclbin/insts.bin from the same MLIR with different names; copy them
+                for sources_to in [mlir_sources_to_xclbins, mlir_sources_to_insts_bins]:
+                    if sources_to.get(mlir_source, [])[1:]:
+                        copy_src = sources_to[mlir_source][0]
+                        for copy_dest in sources_to[mlir_source][1:]:
+                            shutil.copy(copy_src.path, copy_dest.path)
+
+            else:
+                for sources_to in [mlir_sources_to_xclbins, mlir_sources_to_insts_bins]:
+                    for artifact in sources_to.get(mlir_source, []):
+                        self.dry_run.append(
+                            f"pushd {str(self.build_dir)} && {' '.join(compile_cmd)} && popd"
+                        ) 
+                        artifact.fake_available = True
+
+
 
         # With the newly generated files, is_available() should now return True on the Xclbin and InstsBin targets
         return artifacts
@@ -395,10 +432,14 @@ class PeanoCompilationRule(CompilationRule):
                 + ["-c", str(source_file.path), "-o", str(artifact.path)]
             )
             logging.debug(f"Running compilation command: {' '.join(cmd)}")
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                raise RuntimeError(f"Compilation failed: {result.stderr}")
-            logging.debug(f"Successfully compiled: {artifact.path.name}")
+
+            if self.dry_run is None:
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    raise RuntimeError(f"Compilation failed: {result.stderr}")
+                logging.debug(f"Successfully compiled: {artifact.path.name}")
+            else:
+                self.dry_run.append(' '.join(cmd))
 
             if artifact.rename_symbols:
                 self._rename_symbols(artifact)
@@ -418,12 +459,14 @@ class PeanoCompilationRule(CompilationRule):
         cmd += [str(artifact.path)]
 
         logging.debug(f"Running renaming command: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True)
-
-        if result.returncode == 0:
-            logging.debug(f"Successfully renamed symbols in: {artifact.path.name}")
+        if self.dry_run is None:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                logging.info(f"Successfully renamed symbols in: {artifact.path.name}")
+            else:
+                raise RuntimeError(f"Symbol renaming failed: {result.stderr}")
         else:
-            raise RuntimeError(f"Symbol renaming failed: {result.stderr}")
+            self.dry_run.append(' '.join(cmd))
 
 
 class ArchiveCompilationRule(CompilationRule):
@@ -467,14 +510,16 @@ class ArchiveCompilationRule(CompilationRule):
 
             cmd = [str(ar_path), "rcs", archive_path] + object_files
 
-            result = subprocess.run(cmd, capture_output=True, text=True)
-
-            if result.returncode == 0:
-                logging.debug(
-                    f"Successfully created archive: {Path(archive_path).name}"
-                )
+            if self.dry_run is None:
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode == 0:
+                    logging.debug(
+                        f"Successfully created archive: {Path(archive_path).name}"
+                    )
+                else:
+                    raise RuntimeError(f"Archive creation failed: {result.stderr}")
             else:
-                raise RuntimeError(f"Archive creation failed: {result.stderr}")
+                self.dry_run.append(' '.join(cmd))
 
         return artifacts
 
