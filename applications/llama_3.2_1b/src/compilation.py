@@ -102,6 +102,8 @@ class CompilationArtifact(ABC):
         return True
 
     def is_newer_than(self, time):
+        if self.fake_available:
+            return True
         return os.path.getmtime(str(self.path)) > time
 
     def delete(self):
@@ -206,28 +208,28 @@ class GenerateMLIRFromPythonCompilationRule(CompilationRule):
             if not all(dependency.is_available() for dependency in artifact.depends):
                 continue
 
-            # Import the Python source file
-            spec = importlib.util.spec_from_file_location(
-                Path(artifact.import_path).name, artifact.import_path
-            )
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            # We only initiate an MLIR context if requested; otherwise, it is expected that the callback creates the context
-            ctx_callback = lambda: (
-                mlir_mod_ctx() if artifact.requires_context else nullcontext()
-            )
-            with ctx_callback() as ctx:
-                callback_function = getattr(module, artifact.callback_fn)
-                mlir_code = callback_function(
-                    *artifact.callback_args, **artifact.callback_kwargs
+            if self.dry_run is None:
+                # Import the Python source file
+                spec = importlib.util.spec_from_file_location(
+                    Path(artifact.import_path).name, artifact.import_path
                 )
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                # We only initiate an MLIR context if requested; otherwise, it is expected that the callback creates the context
+                ctx_callback = lambda: (
+                    mlir_mod_ctx() if artifact.requires_context else nullcontext()
+                )
+                with ctx_callback() as ctx:
+                    callback_function = getattr(module, artifact.callback_fn)
+                    mlir_code = callback_function(
+                        *artifact.callback_args, **artifact.callback_kwargs
+                    )
                 # Stringify the generated MLIR
                 if artifact.requires_context:
                     mlir_code = str(ctx.module)
                 else:
                     mlir_code = str(mlir_code)
 
-            if self.dry_run is None:
                 with open(artifact.path, "w") as f:
                     f.write(mlir_code)
 
@@ -236,7 +238,7 @@ class GenerateMLIRFromPythonCompilationRule(CompilationRule):
             new_artifact = SourceArtifact.new(artifact.path)
             for user in old_users:
                 user.depends.append(new_artifact)
-            if self.dry_run is None:
+            if self.dry_run is not None:
                 python_cmd = ""
                 # Import the Python source file
                 python_cmd += 'import sys; sys.path.append('f'"{Path(artifact.import_path).parent}"''); '
@@ -439,6 +441,7 @@ class PeanoCompilationRule(CompilationRule):
                     raise RuntimeError(f"Compilation failed: {result.stderr}")
                 logging.debug(f"Successfully compiled: {artifact.path.name}")
             else:
+                artifact.fake_available = True
                 self.dry_run.append(' '.join(cmd))
 
             if artifact.rename_symbols:
@@ -466,6 +469,7 @@ class PeanoCompilationRule(CompilationRule):
             else:
                 raise RuntimeError(f"Symbol renaming failed: {result.stderr}")
         else:
+            artifact.fake_available = True
             self.dry_run.append(' '.join(cmd))
 
 
@@ -519,6 +523,7 @@ class ArchiveCompilationRule(CompilationRule):
                 else:
                     raise RuntimeError(f"Archive creation failed: {result.stderr}")
             else:
+                artifact.fake_available = True
                 self.dry_run.append(' '.join(cmd))
 
         return artifacts
