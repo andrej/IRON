@@ -243,10 +243,28 @@ class GenerateMLIRFromPythonCompilationRule(CompilationRule):
                 # Import the Python source file
                 python_cmd += 'import sys; sys.path.append('f'"{Path(artifact.import_path).parent}"''); '
                 python_cmd += f'from {Path(artifact.import_path).stem} import {artifact.callback_fn}; '
+                
+                # Check if we need to import device classes
+                # Device classes have __module__ == 'abc' but need to be imported from aie.iron.device
+                device_classes = set()
+                for arg in artifact.callback_args:
+                    obj_module = type(arg).__module__
+                    obj_class = type(arg).__name__
+                    if obj_module == 'abc' and (obj_class.startswith('NPU') or obj_class.startswith('XCVC')):
+                        device_classes.add(obj_class)
+                for v in artifact.callback_kwargs.values():
+                    obj_module = type(v).__module__
+                    obj_class = type(v).__name__
+                    if obj_module == 'abc' and (obj_class.startswith('NPU') or obj_class.startswith('XCVC')):
+                        device_classes.add(obj_class)
+                
+                if device_classes:
+                    python_cmd += f"from aie.iron.device import {', '.join(sorted(device_classes))}; "
+                
                 if artifact.requires_context:
                     python_cmd += "from aie.extras.context import mlir_mod_ctx; "
                     python_cmd += "with mlir_mod_ctx() as ctx: "
-                python_cmd += f"mlir_code = {artifact.callback_fn}({', '.join(map(repr, artifact.callback_args))}, {', '.join(f'{k}={repr(v)}' for k, v in artifact.callback_kwargs.items())}); "
+                python_cmd += f"mlir_code = {artifact.callback_fn}({', '.join(map(GenerateMLIRFromPythonCompilationRule._repr_for_codegen, artifact.callback_args))}, {', '.join(f'{k}={_repr_for_codegen(v)}' for k, v in artifact.callback_kwargs.items())}); "
                 if artifact.requires_context:
                     python_cmd += "print(str(ctx.module))"
                 else:
@@ -260,6 +278,26 @@ class GenerateMLIRFromPythonCompilationRule(CompilationRule):
 
         return artifacts
 
+    @staticmethod
+    def _repr_for_codegen(obj):
+        """Convert an object to its string representation for code generation.
+        
+        Handles special cases like device classes that need to be instantiated
+        rather than using their default repr().
+        """
+        # Check if this is a device class from aie.iron.device
+        # These classes have __module__ == 'abc' but are imported from aie.iron.device
+        obj_module = type(obj).__module__
+        obj_class = type(obj).__name__
+        
+        # Check for known device class patterns (NPU1, NPU2, XCVC1902, etc.)
+        # These are imported from aie.iron.device but have __module__ == 'abc'
+        if obj_module == 'abc' and (obj_class.startswith('NPU') or obj_class.startswith('XCVC')):
+            # For device classes, generate instantiation code
+            return f"{obj_class}()"
+        
+        # Default to repr() for other types
+        return repr(obj)
 
 class AieccCompilationRule(CompilationRule):
     def __init__(self, build_dir, peano_dir, mlir_aie_dir, *args, **kwargs):
