@@ -438,6 +438,8 @@ class AIELlamaOperators:
         self.decode.softmax_patch_offsets = get_patch_locs(self.decode.attn_fused_elf_data, softmax_magic)
         assert len(self.decode.softmax_patch_offsets) == config.n_layers + 1
 
+        patch_operators_for_decode(self.decode, config, 128)
+        
         # Attention score scaling operators
         # FIXME: Using elementwise mul is very wasteful (of bandwidth) here since it's the same scalar factor for all values; need a kernel that allows scalar multiplication of a vector; maybe use AXPY
         self.prefill.attn_scale = AIEElementwiseMul(
@@ -1026,7 +1028,7 @@ def llama_forward_pass_decode(config, state):
     batch, seq_len = state.token_ids.shape
     assert seq_len == 1 
 
-    patch_operators_for_decode(aie_ops.decode, config, state.num_preceding_tokens)
+    #patch_operators_for_decode(aie_ops.decode, config, state.num_preceding_tokens)
 
     # Step 1: Prefill RoPE angle look-up tables
     angles_slice = config.angles[state.num_preceding_tokens : state.num_preceding_tokens + seq_len]
@@ -1054,32 +1056,34 @@ def llama_forward_pass_decode(config, state):
 
 def transformer_blocks_forward_decode(config, num_preceding_tokens):
     fused_op = aie_ops.decode.attn_fused
-    fused_op.input_buffer.view_as_torch().to("cpu")[:] = 0
-    fused_op.output_buffer.view_as_torch().to("cpu")[:] = 0
-    fused_op.scratch_buffer.view_as_torch().to("cpu")[:] = 0
+    #fused_op.input_buffer.view_as_torch().to("cpu")[:] = 0
+    #fused_op.output_buffer.view_as_torch().to("cpu")[:] = 0
+    #fused_op.scratch_buffer.view_as_torch().to("cpu")[:] = 0
 
     for layer_idx in range(config.n_layers):
-        fused_op.get_buffer(f"W_norm1_{layer_idx}").to("cpu").view_as_torch()[:] = aie_buffers.W_norm1[layer_idx].to("cpu").view_as_torch().flatten()
-        fused_op.get_buffer(f"W_attn_query_{layer_idx}").to("cpu").view_as_torch()[:] = aie_buffers.W_attn_query_decode[layer_idx].to("cpu").view_as_torch().flatten()
-        fused_op.get_buffer(f"W_attn_key_{layer_idx}").to("cpu").view_as_torch()[:] = aie_buffers.W_attn_key_decode[layer_idx].to("cpu").view_as_torch().flatten()
-        fused_op.get_buffer(f"W_attn_value_{layer_idx}").to("cpu").view_as_torch()[:] = aie_buffers.W_attn_value_decode[layer_idx].to("cpu").view_as_torch().flatten()
-        fused_op.get_buffer(f"W_attn_output_decode_{layer_idx}").to("cpu").view_as_torch()[:] = aie_buffers.W_attn_output_decode[layer_idx].to("cpu").view_as_torch().flatten()
-        fused_op.get_buffer(f"W_norm2_{layer_idx}").to("cpu").view_as_torch()[:] = aie_buffers.W_norm2[layer_idx].to("cpu").view_as_torch().flatten()
-        fused_op.get_buffer(f"W_ffn_gate_{layer_idx}").to("cpu").view_as_torch()[:] = aie_buffers.W_ffn_gate_decode[layer_idx].to("cpu").view_as_torch().flatten()
-        fused_op.get_buffer(f"W_ffn_up_{layer_idx}").to("cpu").view_as_torch()[:] = aie_buffers.W_ffn_up_decode[layer_idx].to("cpu").view_as_torch().flatten()
-        fused_op.get_buffer(f"W_ffn_down_{layer_idx}").to("cpu").view_as_torch()[:] = aie_buffers.W_ffn_down_decode[layer_idx].to("cpu").view_as_torch().flatten()
-        fused_op.get_buffer(f"keys_cache_{layer_idx}").to("cpu").view_as_torch()[:] = aie_buffers.keys_cache[layer_idx].to("cpu").view_as_torch().flatten()
-        fused_op.get_buffer(f"values_cache_{layer_idx}").to("cpu").view_as_torch()[:] = aie_buffers.values_cache[layer_idx].to("cpu").view_as_torch().flatten()
+        #fused_op.get_buffer(f"W_norm1_{layer_idx}").to("cpu").view_as_torch()[:] = aie_buffers.W_norm1[layer_idx].to("cpu").view_as_torch().flatten()
+        #fused_op.get_buffer(f"W_attn_query_{layer_idx}").to("cpu").view_as_torch()[:] = aie_buffers.W_attn_query_decode[layer_idx].to("cpu").view_as_torch().flatten()
+        #fused_op.get_buffer(f"W_attn_key_{layer_idx}").to("cpu").view_as_torch()[:] = aie_buffers.W_attn_key_decode[layer_idx].to("cpu").view_as_torch().flatten()
+        #fused_op.get_buffer(f"W_attn_value_{layer_idx}").to("cpu").view_as_torch()[:] = aie_buffers.W_attn_value_decode[layer_idx].to("cpu").view_as_torch().flatten()
+        #fused_op.get_buffer(f"W_attn_output_decode_{layer_idx}").to("cpu").view_as_torch()[:] = aie_buffers.W_attn_output_decode[layer_idx].to("cpu").view_as_torch().flatten()
+        #fused_op.get_buffer(f"W_norm2_{layer_idx}").to("cpu").view_as_torch()[:] = aie_buffers.W_norm2[layer_idx].to("cpu").view_as_torch().flatten()
+        #fused_op.get_buffer(f"W_ffn_gate_{layer_idx}").to("cpu").view_as_torch()[:] = aie_buffers.W_ffn_gate_decode[layer_idx].to("cpu").view_as_torch().flatten()
+        #fused_op.get_buffer(f"W_ffn_up_{layer_idx}").to("cpu").view_as_torch()[:] = aie_buffers.W_ffn_up_decode[layer_idx].to("cpu").view_as_torch().flatten()
+        #fused_op.get_buffer(f"W_ffn_down_{layer_idx}").to("cpu").view_as_torch()[:] = aie_buffers.W_ffn_down_decode[layer_idx].to("cpu").view_as_torch().flatten()
+        #fused_op.get_buffer(f"keys_cache_{layer_idx}").to("cpu").view_as_torch()[:] = aie_buffers.keys_cache[layer_idx].to("cpu").view_as_torch().flatten()
+        #fused_op.get_buffer(f"values_cache_{layer_idx}").to("cpu").view_as_torch()[:] = aie_buffers.values_cache[layer_idx].to("cpu").view_as_torch().flatten()
+        pass
 
     fused_op.get_buffer("x").to("cpu").view_as_torch()[:] = aie_buffers.decode.x.to("cpu").view_as_torch().flatten()
-    fused_op.get_buffer("rope_angles").to("cpu").view_as_torch()[:] = aie_buffers.decode.rope_angles.to("cpu").view_as_torch().flatten()
-    fused_op.get_buffer("attn_scale_factor").to("cpu").view_as_torch()[:] = aie_buffers.decode.attn_scale_factor.to("cpu").view_as_torch().flatten()
+    #fused_op.get_buffer("rope_angles").to("cpu").view_as_torch()[:] = aie_buffers.decode.rope_angles.to("cpu").view_as_torch().flatten()
+    #fused_op.get_buffer("attn_scale_factor").to("cpu").view_as_torch()[:] = aie_buffers.decode.attn_scale_factor.to("cpu").view_as_torch().flatten()
 
     fused_op()
     
     for layer_idx in range(config.n_layers):
-        aie_buffers.keys_cache[layer_idx].to("cpu").view_as_torch().flatten()[:] = fused_op.get_buffer(f"keys_cache_{layer_idx}").to("cpu").view_as_torch().flatten()
-        aie_buffers.values_cache[layer_idx].to("cpu").view_as_torch().flatten()[:] = fused_op.get_buffer(f"values_cache_{layer_idx}").to("cpu").view_as_torch().flatten()
+        #aie_buffers.keys_cache[layer_idx].to("cpu").view_as_torch().flatten()[:] = fused_op.get_buffer(f"keys_cache_{layer_idx}").to("cpu").view_as_torch().flatten()
+        #aie_buffers.values_cache[layer_idx].to("cpu").view_as_torch().flatten()[:] = fused_op.get_buffer(f"values_cache_{layer_idx}").to("cpu").view_as_torch().flatten()
+        pass
     aie_buffers.decode.x.to("cpu").view_as_torch()[:] = fused_op.get_buffer("x").to("cpu").view_as_torch()[:]
 
 
