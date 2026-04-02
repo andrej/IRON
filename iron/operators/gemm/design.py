@@ -285,17 +285,17 @@ def my_matmul(
         C_l1_ty_internal = np.ndarray[(m, n), np.dtype[dtype_out_internal]]
         # A kernel to convert from the internal f32 accumulation to bf16 for transfer to L2 is needed
         convert_copy_kernel = Kernel(
-            f"convert_copy_f32_to_bf16",
+            f"{func_prefix}convert_copy_f32_to_bf16",
             kernel_archive,
             [C_l1_ty_internal, C_l1_ty, np.int32],
         )
         # Fix the kernels to use f32 outputs
         zero_kernel = Kernel(
-            f"zero{scalar_suffix}_f32",
+            f"{func_prefix}zero{scalar_suffix}_f32",
             kernel_archive,
             [C_l1_ty_internal],
         )
-        matmul_func_name = f"matmul{scalar_suffix}_{dtype_in_str}_f32"
+        matmul_func_name = f"{func_prefix}matmul{scalar_suffix}_{dtype_in_str}_f32"
         matmul_kernel = Kernel(
             matmul_func_name,
             kernel_archive,
@@ -306,11 +306,11 @@ def my_matmul(
         # we only need the zero and matmul kernels
         fifo_depth_out = fifo_depth
         zero_kernel = Kernel(
-            f"zero{scalar_suffix}_{dtype_out_str}",
+            f"{func_prefix}zero{scalar_suffix}_{dtype_out_str}",
             kernel_archive,
             [C_l1_ty],
         )
-        matmul_func_name = f"matmul{scalar_suffix}_{dtype_in_str}_{dtype_out_str}"
+        matmul_func_name = f"{func_prefix}matmul{scalar_suffix}_{dtype_in_str}_{dtype_out_str}"
         matmul_kernel = Kernel(
             matmul_func_name,
             kernel_archive,
