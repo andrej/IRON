@@ -3,6 +3,7 @@
 
 #include <aie_api/aie.hpp>
 #include <stdint.h>
+#include <math.h>
 
 #define SM_VEC_LEN 64   // 32
 #define log2e 1.4453125 // 1.44269504089
@@ -30,7 +31,7 @@ void softmax_simple_bf16(bfloat16 *restrict input_vector, bfloat16 *restrict out
     aie::vector<bfloat16, SM_VEC_LEN> in_elems, exp_val, input_bf16, log2e_vec, max_val_vec;
     aie::accum<accfloat, SM_VEC_LEN> out_vals, exp_val_accum, scaled_accum, exp_in_accum;
 
-    float max_val = 0;
+    float max_val = -INFINITY;
     float accum_exp_val = 0;
     float running_max = 0;
     bfloat16 col_sum_inv;
