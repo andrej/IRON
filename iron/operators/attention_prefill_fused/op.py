@@ -39,27 +39,18 @@ class AttentionPrefillFusedCallable:
             ("W_output", op.W_output),
         ]:
             if weight is not None:
-                try:
-                    buf = self.fused_callable.get_buffer(name)
-                    buf.view_as_np()[:] = torch_to_numpy(weight).flatten()
-                except (KeyError, ValueError):
-                    pass  # Buffer not in truncated runlist
+                buf = self.fused_callable.get_buffer(name)
+                buf.view_as_np()[:] = torch_to_numpy(weight).flatten()
 
         # Load scale factor
         if op.attn_scale_factor is not None:
-            try:
-                scale_buf = self.fused_callable.get_buffer("attn_scale_factor")
-                scale_buf.view_as_np()[:] = torch_to_numpy(op.attn_scale_factor).flatten()
-            except (KeyError, ValueError):
-                pass
+            scale_buf = self.fused_callable.get_buffer("attn_scale_factor")
+            scale_buf.view_as_np()[:] = torch_to_numpy(op.attn_scale_factor).flatten()
 
         # Load causal mask
         if op.causal_mask is not None:
-            try:
-                mask_buf = self.fused_callable.get_buffer("causal_mask")
-                mask_buf.view_as_np()[:] = torch_to_numpy(op.causal_mask).flatten()
-            except (KeyError, ValueError):
-                pass
+            mask_buf = self.fused_callable.get_buffer("causal_mask")
+            mask_buf.view_as_np()[:] = torch_to_numpy(op.causal_mask).flatten()
 
         # Sync input buffer (weights + scale + mask) to NPU
         self.fused_callable.input_buffer.to("npu")
@@ -86,18 +77,15 @@ class AttentionPrefillFusedCallable:
         )
 
         # Write rope_angles to sub-buffer
-        try:
-            rope_sub = fc.get_buffer("rope_angles")
-            np.copyto(
-                np.frombuffer(
-                    rope_sub.memory_view,
-                    dtype=rope_sub.dtype,
-                    count=int(np.prod(rope_sub.shape)),
-                ).reshape(rope_sub.shape),
-                rope_angles_buf.view_as_np().flatten(),
-            )
-        except (KeyError, ValueError):
-            pass  # Not in truncated runlist
+        rope_sub = fc.get_buffer("rope_angles")
+        np.copyto(
+            np.frombuffer(
+                rope_sub.memory_view,
+                dtype=rope_sub.dtype,
+                count=int(np.prod(rope_sub.shape)),
+            ).reshape(rope_sub.shape),
+            rope_angles_buf.view_as_np().flatten(),
+        )
 
         # Force-sync input buffer to NPU
         fc.input_buffer.on = "cpu"
@@ -109,16 +97,13 @@ class AttentionPrefillFusedCallable:
         # Force-sync output buffer from NPU
         fc.output_buffer.on = "npu"
         fc.output_buffer.to("cpu")
-        try:
-            output_sub = fc.get_buffer("attn_output")
-            out_np = np.frombuffer(
-                output_sub.memory_view,
-                dtype=output_sub.dtype,
-                count=int(np.prod(output_sub.shape)),
-            ).reshape(output_sub.shape)
-            np.copyto(output_buf.view_as_np().reshape(out_np.shape), out_np)
-        except (KeyError, ValueError):
-            pass  # Not in truncated runlist
+        output_sub = fc.get_buffer("attn_output")
+        out_np = np.frombuffer(
+            output_sub.memory_view,
+            dtype=output_sub.dtype,
+            count=int(np.prod(output_sub.shape)),
+        ).reshape(output_sub.shape)
+        np.copyto(output_buf.view_as_np().reshape(out_np.shape), out_np)
 
 
 class AIEAttentionPrefillFused:
@@ -145,7 +130,6 @@ class AIEAttentionPrefillFused:
         embedding_dim,
         seq_len,
         context=None,
-        max_runlist_entries=None,
     ):
         assert head_dim == 64, "head_dim must be 64 (hardware constraint)"
         assert num_heads % num_kv_groups == 0, "num_heads must be divisible by num_kv_groups"
@@ -168,7 +152,6 @@ class AIEAttentionPrefillFused:
         self.causal_mask = None      # (H*S, S) with -inf for future positions
 
         self.fused_op = None
-        self.max_runlist_entries = max_runlist_entries
 
     def compile(self):
         """Build the FusedMLIROperator and compile the ELF."""
@@ -465,37 +448,15 @@ class AIEAttentionPrefillFused:
             "context_interleaved": S * H * d * bytes_per_elem,
         }
 
-        # Truncate runlist for incremental debugging
-        if self.max_runlist_entries is not None:
-            runlist = runlist[: self.max_runlist_entries]
-
-        # Collect buffer names actually used in the (possibly truncated) runlist
-        used_bufs = set()
-        for entry in runlist:
-            for arg in entry[1:]:
-                base = arg.split("[")[0]
-                used_bufs.add(base)
-
-        all_input_args = [
-            "input", "rope_angles", "W_query", "W_key", "W_value",
-            "W_output", "attn_scale_factor", "causal_mask",
-        ]
-        all_output_args = ["attn_output"]
-
-        active_input_args = [a for a in all_input_args if a in used_bufs]
-        active_output_args = [a for a in all_output_args if a in used_bufs]
-
-        # Filter buffer_sizes to only include buffers referenced in runlist
-        active_buffer_sizes = {
-            k: v for k, v in buffer_sizes.items() if k in used_bufs
-        }
-
         self.fused_op = FusedMLIROperator(
             "attention_prefill_fused",
             runlist,
-            input_args=active_input_args,
-            output_args=active_output_args,
-            buffer_sizes=active_buffer_sizes,
+            input_args=[
+                "input", "rope_angles", "W_query", "W_key", "W_value",
+                "W_output", "attn_scale_factor", "causal_mask",
+            ],
+            output_args=["attn_output"],
+            buffer_sizes=buffer_sizes,
             context=elf_ctx,
         ).compile()
 
