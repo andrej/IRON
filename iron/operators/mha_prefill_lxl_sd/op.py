@@ -59,8 +59,10 @@ def _build_core_ops(H, G, d, E, S, elf_ctx, causal_mask=True):
         tile_n=16, context=elf_ctx, prio_accuracy=True,
     )
     reinterleave = AIEStridedCopy(
-        input_sizes=(H, S, d), input_strides=(S * d, d, 1), input_offset=0,
-        output_sizes=(H, S, d), output_strides=(d, H * d, 1), output_offset=0,
+        #input_sizes=(H, S, d), input_strides=(S * d, d, 1), input_offset=0,
+        input_sizes=(1, 1, 1, H * S * d), input_strides=(0, 0, 0, 1), input_offset=0,
+        #output_sizes=(H, S, d), output_strides=(d, H * d, 1), output_offset=0,
+        output_sizes=(H, 256, S // 256, d), output_strides=(d, 256 * H * d, H * d, 1), output_offset=0,
         input_buffer_size=H * S * d, output_buffer_size=S * H * d,
         transfer_size=S * d, num_aie_channels=1, context=elf_ctx,
     )
