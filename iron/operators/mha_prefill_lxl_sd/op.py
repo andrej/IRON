@@ -25,13 +25,15 @@ def _pick_tile_n(N, num_cols, max_tile_n=64):
     return tile_n
 
 
-def _build_core_ops(H, G, d, E, S, elf_ctx):
+def _build_core_ops(H, G, d, E, S, elf_ctx, causal_mask=True):
     """Build core attention sub-ops and runlist (no projections/RoPE/GQA).
 
     Expects pre-processed inputs:
       queries: (H, S, d) deinterleaved, contiguous per head
       keys: (H, d, S) transposed and GQA-repeated
       values: (H, S, d) GQA-repeated
+
+    If causal_mask=False, the elementwise-add masking step is omitted.
     """
     B = 2  # bytes per bf16 element
 
@@ -43,10 +45,11 @@ def _build_core_ops(H, G, d, E, S, elf_ctx):
         size=H * S * S, tile_size=S * S // 8,
         num_aie_columns=8, context=elf_ctx,
     )
-    mask = AIEElementwiseAdd(
-        size=H * S * S, tile_size=S * S // 8,
-        num_aie_columns=8, context=elf_ctx,
-    )
+    if causal_mask:
+        mask = AIEElementwiseAdd(
+            size=H * S * S, tile_size=S * S // 8,
+            num_aie_columns=8, context=elf_ctx,
+        )
     softmax = AIESoftmax(
         rows=H * S, cols=S, num_aie_columns=1, num_channels=1,
         rtp_vector_size=S, context=elf_ctx,
@@ -79,8 +82,19 @@ def _build_core_ops(H, G, d, E, S, elf_ctx):
            f"attn_scores[{h*sh}:{(h+1)*sh}]")
           for h in range(H)],
         (scale, "attn_scores", "attn_scale_factor", "attn_scores"),
-        (mask, "attn_scores", "causal_mask", "attn_scores_masked"),
-        (softmax, "attn_scores_masked", "attn_weights"),
+    ]
+
+    if causal_mask:
+        runlist += [
+            (mask, "attn_scores", "causal_mask", "attn_scores_masked"),
+            (softmax, "attn_scores_masked", "attn_weights"),
+        ]
+    else:
+        runlist += [
+            (softmax, "attn_scores", "attn_weights"),
+        ]
+
+    runlist += [
         *[(gemm_context,
            f"attn_weights[{h*sh}:{(h+1)*sh}]",
            f"values[{h*kSd}:{(h+1)*kSd}]",
@@ -95,11 +109,12 @@ def _build_core_ops(H, G, d, E, S, elf_ctx):
         "keys": H * d * S * B,
         "values": H * S * d * B,
         "attn_scores": H * S * S * B,
-        "attn_scores_masked": H * S * S * B,
         "attn_weights": H * S * S * B,
         "attn_context": H * S * d * B,
         "context_interleaved": S * H * d * B,
     }
+    if causal_mask:
+        buffer_sizes["attn_scores_masked"] = H * S * S * B
 
     return runlist, buffer_sizes
 
@@ -111,7 +126,7 @@ class AIEAttentionPrefillFused(FusedMLIROperator):
     """
 
     def __init__(self, num_heads, num_kv_groups, head_dim, embedding_dim,
-                 seq_len, context=None):
+                 seq_len, causal_mask=True, context=None):
         assert head_dim == 64
         assert num_heads % num_kv_groups == 0
         assert seq_len % 256 == 0
@@ -126,13 +141,19 @@ class AIEAttentionPrefillFused(FusedMLIROperator):
         elf_ctx = context or AIEContext()
         runlist, buffer_sizes = _build_core_ops(
             num_heads, num_kv_groups, head_dim, embedding_dim, seq_len, elf_ctx,
+            causal_mask=causal_mask,
         )
 
+        mask_suffix = "_causal" if causal_mask else "_nomask"
+        input_args = ["queries", "keys", "values",
+                       "W_output", "attn_scale_factor"]
+        if causal_mask:
+            input_args.append("causal_mask")
+
         super().__init__(
-            name=f"attention_prefill_fused_{num_heads}h{num_kv_groups}g{head_dim}d{embedding_dim}e{seq_len}s",
+            name=f"attention_prefill_fused_{num_heads}h{num_kv_groups}g{head_dim}d{embedding_dim}e{seq_len}s{mask_suffix}",
             runlist=runlist,
-            input_args=["queries", "keys", "values",
-                         "W_output", "attn_scale_factor", "causal_mask"],
+            input_args=input_args,
             output_args=["attn_output"],
             buffer_sizes=buffer_sizes,
             context=elf_ctx,
@@ -146,7 +167,7 @@ class AIEAttentionPrefillProjectedFused(FusedMLIROperator):
     """
 
     def __init__(self, num_heads, num_kv_groups, head_dim, embedding_dim,
-                 seq_len, context=None):
+                 seq_len, causal_mask=True, context=None):
         assert head_dim == 64
         assert num_heads % num_kv_groups == 0
         assert seq_len % 256 == 0
@@ -231,14 +252,19 @@ class AIEAttentionPrefillProjectedFused(FusedMLIROperator):
         }
 
         core_runlist, core_buffer_sizes = _build_core_ops(
-            H, G, d, E, S, elf_ctx,
+            H, G, d, E, S, elf_ctx, causal_mask=causal_mask,
         )
 
+        mask_suffix = "_causal" if causal_mask else "_nomask"
+        input_args = ["input", "rope_angles", "W_query", "W_key", "W_value",
+                       "W_output", "attn_scale_factor"]
+        if causal_mask:
+            input_args.append("causal_mask")
+
         super().__init__(
-            name=f"attention_prefill_projected_fused_{H}h{G}g{d}d{E}e{S}s",
+            name=f"attention_prefill_projected_fused_{H}h{G}g{d}d{E}e{S}s{mask_suffix}",
             runlist=prefix_runlist + core_runlist,
-            input_args=["input", "rope_angles", "W_query", "W_key", "W_value",
-                         "W_output", "attn_scale_factor", "causal_mask"],
+            input_args=input_args,
             output_args=["attn_output"],
             buffer_sizes={**prefix_buffer_sizes, **core_buffer_sizes},
             context=elf_ctx,

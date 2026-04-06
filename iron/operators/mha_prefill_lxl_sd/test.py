@@ -1,8 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import time
-
 import numpy as np
 import pytest
 import torch
@@ -25,8 +23,21 @@ MAX_ERROR_RATE = 0.03
 def get_params():
     return [
         pytest.param(2, 2, 64, 256, 256, id="H2"),
-        pytest.param(32, 8, 64, 2048, 256, id="H32"),
+        pytest.param(32, 8, 64, 2048, 256, id="Llama3.2-256seq"),
+        pytest.param(12, 12, 64, 768, 256, id="GPT2-Small-256seq"),
     ]
+
+
+def get_benchmark_params():
+    """GPT-2 Small across sequence lengths 256..32768, with/without causal mask."""
+    params = []
+    S = 256
+    while S <= 32768:
+        for mask in [True, False]:
+            tag = "causal" if mask else "nomask"
+            params.append(pytest.param(12, 12, 64, 768, S, mask, id=f"GPT2-S{S}-{tag}"))
+        S *= 2
+    return params
 
 
 def _load_input(fc, name, tensor):
@@ -78,16 +89,14 @@ def _projected_gemm_flops(H, G, d, E, S):
     return query_proj + kv_proj + _core_gemm_flops(H, G, d, E, S)
 
 
-def _print_metrics(label, elapsed_s, flops):
-    """Print latency and throughput metrics."""
-    gflops = flops / elapsed_s / 1e9
-    print(f"  {label}: {elapsed_s*1e3:.2f} ms, {gflops:.2f} GFLOPS")
-
-
 # ---------------------------------------------------------------------------
 # Core attention tests (pre-projected Q, K, V)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.metrics(
+    Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
+    Throughput=r"Throughput: (?P<value>[\d\.e\+-]+) GFLOP/s",
+)
 @pytest.mark.parametrize("H,G,d,E,S", get_params())
 def test_mha_pefill_lxl_sd(H, G, d, E, S):
     """Core attention: score GEMM -> scale -> mask -> softmax -> context GEMM -> output."""
@@ -104,10 +113,12 @@ def test_mha_pefill_lxl_sd(H, G, d, E, S):
     _load_input(fc, "attn_scale_factor", golden["attn_scale_factor"])
     _load_input(fc, "causal_mask", golden["causal_mask"])
 
-    t0 = time.perf_counter()
     fc()
-    elapsed = time.perf_counter() - t0
-    _print_metrics("core", elapsed, _core_gemm_flops(H, G, d, E, S))
+
+    latency_us = fc.last_elapsed * 1e6
+    gflops = _core_gemm_flops(H, G, d, E, S) / (fc.last_elapsed) / 1e9
+    print(f"\nLatency (us): {latency_us:.1f}")
+    print(f"Throughput: {gflops:.6e} GFLOP/s")
 
     _verify_output(fc, golden, H, d, S, E)
 
@@ -116,6 +127,10 @@ def test_mha_pefill_lxl_sd(H, G, d, E, S):
 # Projected attention tests (with Q/K/V projections + RoPE)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.metrics(
+    Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
+    Throughput=r"Throughput: (?P<value>[\d\.e\+-]+) GFLOP/s",
+)
 @pytest.mark.parametrize("H,G,d,E,S", get_params())
 def test_attention_prefill_projected_fused(H, G, d, E, S):
     """Projected attention: Q/K/V proj -> RoPE -> GQA -> attention -> output proj."""
@@ -134,12 +149,48 @@ def test_attention_prefill_projected_fused(H, G, d, E, S):
     _load_input(fc, "attn_scale_factor", golden["attn_scale_factor"])
     _load_input(fc, "causal_mask", golden["causal_mask"])
 
-    t0 = time.perf_counter()
     fc()
-    elapsed = time.perf_counter() - t0
-    _print_metrics("projected", elapsed, _projected_gemm_flops(H, G, d, E, S))
+
+    latency_us = fc.last_elapsed * 1e6
+    gflops = _projected_gemm_flops(H, G, d, E, S) / (fc.last_elapsed) / 1e9
+    print(f"\nLatency (us): {latency_us:.1f}")
+    print(f"Throughput: {gflops:.6e} GFLOP/s")
 
     _verify_output(fc, golden, H, d, S, E)
+
+
+# ---------------------------------------------------------------------------
+# Benchmark: GPT-2 Small core MHA across sequence lengths, +/- causal mask
+# ---------------------------------------------------------------------------
+
+@pytest.mark.benchmark
+@pytest.mark.metrics(
+    Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
+    Throughput=r"Throughput: (?P<value>[\d\.e\+-]+) GFLOP/s",
+)
+@pytest.mark.parametrize("H,G,d,E,S,causal", get_benchmark_params())
+def test_mha_prefill_benchmark(H, G, d, E, S, causal):
+    """Benchmark core MHA for GPT-2 Small across sequence lengths."""
+    golden = generate_golden_reference(H, G, d, E, S)
+
+    op = AIEAttentionPrefillFused(H, G, d, E, S, causal_mask=causal)
+    op.compile()
+    fc = op.get_callable()
+
+    _load_input(fc, "queries", golden["queries_deinterleaved"])
+    _load_input(fc, "keys", golden["keys_for_scores"])
+    _load_input(fc, "values", golden["values_for_context"])
+    _load_input(fc, "W_output", golden["W_output"])
+    _load_input(fc, "attn_scale_factor", golden["attn_scale_factor"])
+    if causal:
+        _load_input(fc, "causal_mask", golden["causal_mask"])
+
+    fc()
+
+    latency_us = fc.last_elapsed * 1e6
+    gflops = _core_gemm_flops(H, G, d, E, S) / (fc.last_elapsed) / 1e9
+    print(f"\nLatency (us): {latency_us:.1f}")
+    print(f"Throughput: {gflops:.6e} GFLOP/s")
 
 
 # ---------------------------------------------------------------------------

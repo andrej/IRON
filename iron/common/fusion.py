@@ -5,6 +5,7 @@ import numpy as np
 import ml_dtypes
 import pyxrt
 import ctypes
+import time
 from . import compilation as comp
 from .base import AIEOperatorBase, MLIROperator
 from .utils import XRTSubBuffer
@@ -290,8 +291,10 @@ class FullELFCallable:
         for i, arg in enumerate(args):
             assert isinstance(arg, pyxrt.bo), f"Argument {i} is not a pyxrt.bo"
             run.set_arg(i, arg)
+        t0 = time.perf_counter()
         run.start()
         ret_code = run.wait()
+        self.last_elapsed = time.perf_counter() - t0
         if ret_code != pyxrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED:
             raise RuntimeError(f"Kernel execution failed with return code {ret_code}")
 
