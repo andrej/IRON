@@ -83,17 +83,17 @@ def _build_core_ops(H, G, d, E, S, elf_ctx, causal_mask=True):
            f"keys[{h*kdS}:{(h+1)*kdS}]",
            f"attn_scores[{h*sh}:{(h+1)*sh}]")
           for h in range(H)],
-        (scale, "attn_scores", "attn_scale_factor", "attn_scores"),
+        (scale, "attn_scores", "attn_scale_factor", "attn_scores_scaled"),
     ]
 
     if causal_mask:
         runlist += [
-            (mask, "attn_scores", "causal_mask", "attn_scores_masked"),
+            (mask, "attn_scores_scaled", "causal_mask", "attn_scores_masked"),
             (softmax, "attn_scores_masked", "attn_weights"),
         ]
     else:
         runlist += [
-            (softmax, "attn_scores", "attn_weights"),
+            (softmax, "attn_scores_scaled", "attn_weights"),
         ]
 
     runlist += [
@@ -111,6 +111,7 @@ def _build_core_ops(H, G, d, E, S, elf_ctx, causal_mask=True):
         "keys": H * d * S * B,
         "values": H * S * d * B,
         "attn_scores": H * S * S * B,
+        "attn_scores_scaled": H * S * S * B,
         "attn_weights": H * S * S * B,
         "attn_context": H * S * d * B,
         "context_interleaved": S * H * d * B,
