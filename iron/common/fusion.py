@@ -43,8 +43,7 @@ class FusedMLIROperator(AIEOperatorBase):
         """Collect all kernel artifacts from child operators.
 
         Returns:
-            List of KernelObjectArtifact instances from all unique child operators,
-            with filenames and symbol prefixes disambiguated per operator index.
+            List of KernelObjectArtifact instances from all unique child operators.
         """
         kernel_artifacts = []
         seen: dict[int, object] = {}
@@ -53,9 +52,6 @@ class FusedMLIROperator(AIEOperatorBase):
         ]
         for idx, op in enumerate(unique_operators):
             objs = op.get_kernel_artifacts()
-            for obj in objs:
-                obj.filename = f"op{idx}_{obj.filename}"
-                obj.prefix_symbols = f"op{idx}_"
             kernel_artifacts.extend(objs)
         return kernel_artifacts
 
@@ -83,8 +79,6 @@ class FusedMLIROperator(AIEOperatorBase):
         ]
         for idx, op in enumerate(unique_operators):
             mlir_artifact = op.get_mlir_artifact()
-            if len(op.get_kernel_artifacts()) > 0:
-                mlir_artifact.generator.kwargs["func_prefix"] = f"op{idx}_"
             op_name = f"op{idx}_{op.__class__.__name__}"
             op_names[id(op)] = op_name
             operator_mlir_map[op_name] = mlir_artifact
@@ -374,10 +368,10 @@ class FusedFullELFCallable(FullELFCallable):
         return sub_buffer
 
     def __call__(self):
-        self.input_buffer.to("npu")
+        self.input_buffer._sync_to_device()
         super().__call__(
             self.input_buffer.buffer_object(),
             self.output_buffer.buffer_object(),
             self.scratch_buffer.buffer_object(),
         )
-        self.output_buffer.to("cpu")
+        self.output_buffer._sync_from_device()

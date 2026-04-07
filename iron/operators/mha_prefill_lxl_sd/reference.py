@@ -3,7 +3,19 @@
 
 import torch
 
-from iron.operators.rope.rope_utils import apply_rope as _apply_rope_4d
+
+def _apply_rope_4d(x, angles):
+    """Apply RoPE to a 4D tensor using interleaved cos/sin angles.
+
+    x: (batch, heads, seq_len, head_dim)
+    angles: (seq_len, head_dim) with interleaved [cos_0, sin_0, cos_1, sin_1, ...]
+    Returns: same shape as x with RoPE applied (two-halves method).
+    """
+    half = x.shape[-1] // 2
+    cos = angles[:, ::2].unsqueeze(0).unsqueeze(0)   # (1, 1, S, half)
+    sin = angles[:, 1::2].unsqueeze(0).unsqueeze(0)  # (1, 1, S, half)
+    x1, x2 = x[..., :half], x[..., half:]
+    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
 
 
 def _bf16_matmul(a, b):

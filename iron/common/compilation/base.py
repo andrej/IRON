@@ -502,6 +502,7 @@ class AieccFullElfCompilationRule(AieccCompilationRule):
                 str(self.aiecc_path),
                 "-v",
                 "-j1",
+                "--dynamic-objFifos",
                 "--no-compile-host",
                 "--no-xchesscc",
                 "--no-xbridge",

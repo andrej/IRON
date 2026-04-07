@@ -7,14 +7,14 @@ A layer-by-layer (LxL) single-dispatch (SD) implementation of multi-head attenti
 
 from iron.common.context import AIEContext
 from iron.common.fusion import FusedMLIROperator
-from iron.operators.gemm.op import AIEGEMM
-from iron.operators.rope.op import AIERope
-from iron.operators.strided_copy.op import AIEStridedCopy
-from iron.operators.repeat.op import AIERepeat
-from iron.operators.softmax.op import AIESoftmax
-from iron.operators.transpose.op import AIETranspose
-from iron.operators.elementwise_mul.op import AIEElementwiseMul
-from iron.operators.elementwise_add.op import AIEElementwiseAdd
+from iron.operators.gemm.op import GEMM
+from iron.operators.rope.op import RoPE
+from iron.operators.strided_copy.op import StridedCopy
+from iron.operators.repeat.op import Repeat
+from iron.operators.softmax.op import Softmax
+from iron.operators.transpose.op import Transpose
+from iron.operators.elementwise_mul.op import ElementwiseMul
+from iron.operators.elementwise_add.op import ElementwiseAdd
 
 
 def _pick_tile_n(N, num_cols, max_tile_n=64):
@@ -40,24 +40,24 @@ def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True):
     """
     B = 2  # bytes per bf16 element
 
-    gemm_scores = AIEGEMM(
+    gemm_scores = GEMM(
         M=S, K=d, N=S, num_aie_columns=8, tile_m=16, tile_k=64,
         tile_n=_pick_tile_n(S, 8), context=elf_ctx,
     )
-    scale = AIEElementwiseMul(
+    scale = ElementwiseMul(
         size=H * S * S, tile_size=S * S // 8,
         num_aie_columns=8, context=elf_ctx,
     )
     if causal_mask:
-        mask = AIEElementwiseAdd(
+        mask = ElementwiseAdd(
             size=H * S * S, tile_size=S * S // 8,
             num_aie_columns=8, context=elf_ctx,
         )
-    softmax = AIESoftmax(
+    softmax = Softmax(
         rows=H * S, cols=S, num_aie_columns=1, num_channels=1,
         rtp_vector_size=S, context=elf_ctx,
     )
-    gemm_context = AIEGEMM(
+    gemm_context = GEMM(
         M=S, K=S, N=d, num_aie_columns=4, tile_m=16, tile_k=64,
         tile_n=16, context=elf_ctx, prio_accuracy=True,
     )
@@ -110,7 +110,7 @@ def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True):
     return runlist, buffer_sizes
 
 
-class AIEAttentionPrefillFused(FusedMLIROperator):
+class AttentionPrefillFused(FusedMLIROperator):
     """Fused attention prefill (core, no projections/RoPE).
 
     Accepts pre-projected Q (S*H,d), K (S*G,d), V (S*G,d) in interleaved layout.
@@ -150,7 +150,7 @@ class AIEAttentionPrefillFused(FusedMLIROperator):
         )
 
 
-class AIEAttentionPrefillProjectedFused(FusedMLIROperator):
+class AttentionPrefillProjectedFused(FusedMLIROperator):
     """Fused attention prefill with Q/K/V projections and RoPE.
 
     Accepts raw input (S, E) and rope_angles (S, d).
@@ -176,25 +176,25 @@ class AIEAttentionPrefillProjectedFused(FusedMLIROperator):
         elf_ctx = context or AIEContext()
 
         # ---- Projection + RoPE ----
-        gemm_query = AIEGEMM(
+        gemm_query = GEMM(
             M=S, K=E, N=H * d, num_aie_columns=8, tile_m=16, tile_k=64,
             tile_n=_pick_tile_n(H * d, 8), context=elf_ctx,
         )
-        gemm_kv = AIEGEMM(
+        gemm_kv = GEMM(
             M=S, K=E, N=G * d, num_aie_columns=8, tile_m=16, tile_k=64,
             tile_n=_pick_tile_n(G * d, 8), context=elf_ctx,
         )
-        rope_queries = AIERope(rows=S * H, cols=d, angle_rows=S, context=elf_ctx)
-        rope_keys = AIERope(rows=S * G, cols=d, angle_rows=S, context=elf_ctx)
+        rope_queries = RoPE(rows=S * H, cols=d, angle_rows=S, context=elf_ctx)
+        rope_keys = RoPE(rows=S * G, cols=d, angle_rows=S, context=elf_ctx)
 
         # ---- Deinterleave ----
-        deinterleave_q = AIEStridedCopy(
+        deinterleave_q = StridedCopy(
             input_sizes=(H, S, d), input_strides=(d, H * d, 1), input_offset=0,
             output_sizes=(H, S, d), output_strides=(S * d, d, 1), output_offset=0,
             input_buffer_size=S * H * d, output_buffer_size=H * S * d,
             transfer_size=S * d, num_aie_channels=1, context=elf_ctx,
         )
-        deinterleave_kv = AIEStridedCopy(
+        deinterleave_kv = StridedCopy(
             input_sizes=(G, S, d), input_strides=(d, G * d, 1), input_offset=0,
             output_sizes=(G, S, d), output_strides=(S * d, d, 1), output_offset=0,
             input_buffer_size=S * G * d, output_buffer_size=G * S * d,
@@ -202,11 +202,11 @@ class AIEAttentionPrefillProjectedFused(FusedMLIROperator):
         )
 
         # ---- Transpose keys + GQA repeat ----
-        transpose_keys = AIETranspose(
+        transpose_keys = Transpose(
             M=S, N=d, num_aie_columns=2, num_channels=1,
             m=256, n=32, s=8, context=elf_ctx,
         )
-        repeat_kv = AIERepeat(
+        repeat_kv = Repeat(
             rows=G, cols=d * S, repeat=group_size,
             transfer_size=d, context=elf_ctx,
         )
@@ -246,13 +246,13 @@ class AIEAttentionPrefillProjectedFused(FusedMLIROperator):
         )
 
         # ---- Reinterleave + output projection ----
-        reinterleave = AIEStridedCopy(
+        reinterleave = StridedCopy(
             input_sizes=(1, 1, 1, H * S * d), input_strides=(0, 0, 0, 1), input_offset=0,
             output_sizes=(H, 256, S // 256, d), output_strides=(d, 256 * H * d, H * d, 1), output_offset=0,
             input_buffer_size=H * S * d, output_buffer_size=S * H * d,
             transfer_size=S * d, num_aie_channels=1, context=elf_ctx,
         )
-        gemm_output = AIEGEMM(
+        gemm_output = GEMM(
             M=S, K=H * d, N=E, num_aie_columns=8, tile_m=16, tile_k=64,
             tile_n=_pick_tile_n(E, 8), context=elf_ctx, prio_accuracy=True,
         )

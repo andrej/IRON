@@ -7,11 +7,10 @@ import torch
 from ml_dtypes import bfloat16
 
 from iron.common.test_utils import verify_buffer
-from iron.common.utils import torch_to_numpy
 
 from iron.operators.mha_prefill_lxl_sd.op import (
-    AIEAttentionPrefillFused,
-    AIEAttentionPrefillProjectedFused,
+    AttentionPrefillFused,
+    AttentionPrefillProjectedFused,
 )
 from iron.operators.mha_prefill_lxl_sd.reference import generate_golden_reference
 
@@ -42,27 +41,22 @@ def get_benchmark_params():
 
 def _load_input(fc, name, tensor):
     """Load a tensor into a named sub-buffer of the fused callable."""
-    fc.get_buffer(name).view_as_np()[:] = torch_to_numpy(tensor).flatten()
+    np_buf = tensor.contiguous().view(torch.uint16).numpy().view(bfloat16)
+    fc.get_buffer(name).data[:] = np_buf.flatten()
 
 
 def _get_scratch_tensor(fc, name, shape):
     """Read a named buffer from the fused callable's scratch space."""
-    fc.scratch_buffer.on = "npu"
-    fc.scratch_buffer.to("cpu")
+    fc.scratch_buffer._sync_from_device()
     sub = fc.get_buffer(name)
-    return np.frombuffer(
-        sub.memory_view, dtype=bfloat16, count=int(np.prod(shape))
-    ).reshape(shape).astype(np.float32)
+    return sub.data[:int(np.prod(shape))].reshape(shape).astype(np.float32)
 
 
 def _get_output_tensor(fc, name, shape):
     """Read a named buffer from the fused callable's output space."""
-    fc.output_buffer.on = "npu"
-    fc.output_buffer.to("cpu")
+    fc.output_buffer._sync_from_device()
     sub = fc.get_buffer(name)
-    return np.frombuffer(
-        sub.memory_view, dtype=bfloat16, count=int(np.prod(shape))
-    ).reshape(shape).astype(np.float32)
+    return sub.data[:int(np.prod(shape))].reshape(shape).astype(np.float32)
 
 
 def _verify_output(fc, golden, H, d, S, E):
@@ -72,9 +66,8 @@ def _verify_output(fc, golden, H, d, S, E):
     ).bfloat16()
     chain_ref = (npu_context.float() @ golden["W_output"].float()).to(torch.bfloat16)
 
-    fc.output_buffer.on = "npu"
-    fc.output_buffer.to("cpu")
-    output_np = fc.get_buffer("attn_output").view_as_np()
+    fc.output_buffer._sync_from_device()
+    output_np = fc.get_buffer("attn_output").data
     output = torch.from_numpy(output_np.reshape(S, E).astype(np.float32)).bfloat16()
 
     errors = verify_buffer(
@@ -112,7 +105,7 @@ def test_mha_pefill_lxl_sd(H, G, d, E, S):
     """Core attention: score GEMM -> scale -> mask -> softmax -> context GEMM."""
     golden = generate_golden_reference(H, G, d, E, S)
 
-    op = AIEAttentionPrefillFused(H, G, d, E, S)
+    op = AttentionPrefillFused(H, G, d, E, S)
     op.compile()
     fc = op.get_callable()
 
@@ -152,7 +145,7 @@ def test_attention_prefill_projected_fused(H, G, d, E, S):
     """Projected attention: Q/K/V proj -> RoPE -> GQA -> attention -> output proj."""
     golden = generate_golden_reference(H, G, d, E, S)
 
-    op = AIEAttentionPrefillProjectedFused(H, G, d, E, S)
+    op = AttentionPrefillProjectedFused(H, G, d, E, S)
     op.compile()
     fc = op.get_callable()
 
@@ -189,7 +182,7 @@ def test_mha_prefill_benchmark(H, G, d, E, S, causal):
     """Benchmark core MHA for GPT-2 Small across sequence lengths."""
     golden = generate_golden_reference(H, G, d, E, S)
 
-    op = AIEAttentionPrefillFused(H, G, d, E, S, causal_mask=causal)
+    op = AttentionPrefillFused(H, G, d, E, S, causal_mask=causal)
     op.compile()
     fc = op.get_callable()
 
@@ -226,7 +219,7 @@ def test_mha_pefill_lxl_sd_intermediates(H, G, d, E, S):
     """Check intermediate buffers of core attention (for debugging)."""
     golden = generate_golden_reference(H, G, d, E, S)
 
-    op = AIEAttentionPrefillFused(H, G, d, E, S)
+    op = AttentionPrefillFused(H, G, d, E, S)
     op.compile()
     fc = op.get_callable()
 
