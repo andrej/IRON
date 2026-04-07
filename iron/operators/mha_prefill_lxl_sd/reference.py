@@ -12,7 +12,7 @@ def _apply_rope_4d(x, angles):
     Returns: same shape as x with RoPE applied (two-halves method).
     """
     half = x.shape[-1] // 2
-    cos = angles[:, ::2].unsqueeze(0).unsqueeze(0)   # (1, 1, S, half)
+    cos = angles[:, ::2].unsqueeze(0).unsqueeze(0)  # (1, 1, S, half)
     sin = angles[:, 1::2].unsqueeze(0).unsqueeze(0)  # (1, 1, S, half)
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
@@ -70,7 +70,7 @@ def generate_golden_reference(
     W_output = torch.randn(H * d, E, dtype=torch.bfloat16) * val_range
 
     # Scale factor: 1/sqrt(d), broadcast to (H*S*S,)
-    scale = 1.0 / (d ** 0.5)
+    scale = 1.0 / (d**0.5)
     attn_scale_factor = torch.full((H * S * S,), scale, dtype=torch.bfloat16)
 
     # Causal mask: (H*S, S) — 0 for valid positions, -inf for future
@@ -83,39 +83,61 @@ def generate_golden_reference(
                 )
 
     # ---- Q/K/V projections ----
-    queries_raw = _bf16_matmul(x, W_query)   # (S, H*d)
-    keys_raw = _bf16_matmul(x, W_key)        # (S, G*d)
-    values_raw = _bf16_matmul(x, W_value)    # (S, G*d)
+    queries_raw = _bf16_matmul(x, W_query)  # (S, H*d)
+    keys_raw = _bf16_matmul(x, W_key)  # (S, G*d)
+    values_raw = _bf16_matmul(x, W_value)  # (S, G*d)
 
     # ---- RoPE (reuses rope_utils.apply_rope with 4D interface) ----
     # Reshape interleaved (S, N*d) → (1, N, S, d) for rope_utils
-    queries_roped = _apply_rope_4d(
-        queries_raw.reshape(S, H, d).permute(1, 0, 2).unsqueeze(0),  # (1, H, S, d)
-        rope_angles,
-    ).squeeze(0).permute(1, 0, 2).contiguous().reshape(S * H, d)     # (S*H, d)
+    queries_roped = (
+        _apply_rope_4d(
+            queries_raw.reshape(S, H, d).permute(1, 0, 2).unsqueeze(0),  # (1, H, S, d)
+            rope_angles,
+        )
+        .squeeze(0)
+        .permute(1, 0, 2)
+        .contiguous()
+        .reshape(S * H, d)
+    )  # (S*H, d)
 
-    keys_roped = _apply_rope_4d(
-        keys_raw.reshape(S, G, d).permute(1, 0, 2).unsqueeze(0),     # (1, G, S, d)
-        rope_angles,
-    ).squeeze(0).permute(1, 0, 2).contiguous().reshape(S * G, d)     # (S*G, d)
+    keys_roped = (
+        _apply_rope_4d(
+            keys_raw.reshape(S, G, d).permute(1, 0, 2).unsqueeze(0),  # (1, G, S, d)
+            rope_angles,
+        )
+        .squeeze(0)
+        .permute(1, 0, 2)
+        .contiguous()
+        .reshape(S * G, d)
+    )  # (S*G, d)
 
     # ---- Deinterleave Q/K/V ----
-    queries_deinterleaved = queries_roped.reshape(S, H, d).transpose(0, 1).contiguous()  # (H, S, d)
-    keys_deinterleaved = keys_roped.reshape(S, G, d).transpose(0, 1).contiguous()        # (G, S, d)
-    keys_transposed = keys_deinterleaved.transpose(1, 2).contiguous()                    # (G, d, S)
-    values_deinterleaved = values_raw.reshape(S, G, d).transpose(0, 1).contiguous()      # (G, S, d)
+    queries_deinterleaved = (
+        queries_roped.reshape(S, H, d).transpose(0, 1).contiguous()
+    )  # (H, S, d)
+    keys_deinterleaved = (
+        keys_roped.reshape(S, G, d).transpose(0, 1).contiguous()
+    )  # (G, S, d)
+    keys_transposed = keys_deinterleaved.transpose(1, 2).contiguous()  # (G, d, S)
+    values_deinterleaved = (
+        values_raw.reshape(S, G, d).transpose(0, 1).contiguous()
+    )  # (G, S, d)
 
     # ---- GQA repeat ----
     if group_size > 1:
-        keys_for_scores = keys_transposed.reshape(G, d * S).repeat_interleave(
-            group_size, dim=0
-        ).reshape(H, d, S)
-        values_for_context = values_deinterleaved.reshape(G, S * d).repeat_interleave(
-            group_size, dim=0
-        ).reshape(H, S, d)
+        keys_for_scores = (
+            keys_transposed.reshape(G, d * S)
+            .repeat_interleave(group_size, dim=0)
+            .reshape(H, d, S)
+        )
+        values_for_context = (
+            values_deinterleaved.reshape(G, S * d)
+            .repeat_interleave(group_size, dim=0)
+            .reshape(H, S, d)
+        )
     else:
-        keys_for_scores = keys_transposed        # (H, d, S)
-        values_for_context = values_deinterleaved # (H, S, d)
+        keys_for_scores = keys_transposed  # (H, d, S)
+        values_for_context = values_deinterleaved  # (H, S, d)
 
     # ---- Score GEMM per head ----
     attn_scores = torch.stack(
@@ -133,7 +155,9 @@ def generate_golden_reference(
     # ---- Softmax ----
     attn_weights = torch.nn.functional.softmax(
         attn_scores_masked.float().reshape(H, S, S), dim=-1
-    ).to(torch.bfloat16)  # (H, S, S)
+    ).to(
+        torch.bfloat16
+    )  # (H, S, S)
 
     # ---- Context GEMM per head ----
     attn_context = torch.stack(

@@ -49,14 +49,14 @@ def _get_scratch_tensor(fc, name, shape):
     """Read a named buffer from the fused callable's scratch space."""
     fc.scratch_buffer._sync_from_device()
     sub = fc.get_buffer(name)
-    return sub.data[:int(np.prod(shape))].reshape(shape).astype(np.float32)
+    return sub.data[: int(np.prod(shape))].reshape(shape).astype(np.float32)
 
 
 def _get_output_tensor(fc, name, shape):
     """Read a named buffer from the fused callable's output space."""
     fc.output_buffer._sync_from_device()
     sub = fc.get_buffer(name)
-    return sub.data[:int(np.prod(shape))].reshape(shape).astype(np.float32)
+    return sub.data[: int(np.prod(shape))].reshape(shape).astype(np.float32)
 
 
 def _verify_output(fc, golden, H, d, S, E):
@@ -71,30 +71,35 @@ def _verify_output(fc, golden, H, d, S, E):
     output = torch.from_numpy(output_np.reshape(S, E).astype(np.float32)).bfloat16()
 
     errors = verify_buffer(
-        output, "attn_output", chain_ref.reshape(S, E),
-        rel_tol=REL_TOL, abs_tol=ABS_TOL, max_error_rate=MAX_ERROR_RATE,
+        output,
+        "attn_output",
+        chain_ref.reshape(S, E),
+        rel_tol=REL_TOL,
+        abs_tol=ABS_TOL,
+        max_error_rate=MAX_ERROR_RATE,
     )
     assert not errors, f"Output verification failed with {len(errors)} errors"
 
 
 def _core_gemm_flops(H, G, d, E, S):
     """Count GEMM FLOPs for the core attention operator."""
-    score_flops = H * 2 * S * d * S       # H x (S,d)@(d,S)
-    context_flops = H * 2 * S * S * d     # H x (S,S)@(S,d)
+    score_flops = H * 2 * S * d * S  # H x (S,d)@(d,S)
+    context_flops = H * 2 * S * S * d  # H x (S,S)@(S,d)
     return score_flops + context_flops
 
 
 def _projected_gemm_flops(H, G, d, E, S):
     """Count GEMM FLOPs for the projected attention operator."""
-    query_proj = 2 * S * E * (H * d)      # (S,E)@(E,H*d)
-    kv_proj = 2 * (2 * S * E * (G * d))   # key + value: (S,E)@(E,G*d) each
-    output_proj = 2 * S * (H * d) * E     # (S,H*d)@(H*d,E)
+    query_proj = 2 * S * E * (H * d)  # (S,E)@(E,H*d)
+    kv_proj = 2 * (2 * S * E * (G * d))  # key + value: (S,E)@(E,G*d) each
+    output_proj = 2 * S * (H * d) * E  # (S,H*d)@(H*d,E)
     return query_proj + kv_proj + _core_gemm_flops(H, G, d, E, S) + output_proj
 
 
 # ---------------------------------------------------------------------------
 # Core attention tests (pre-projected Q, K, V)
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.metrics(
     Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
@@ -125,9 +130,12 @@ def test_mha_pefill_lxl_sd(H, G, d, E, S):
     actual = _get_output_tensor(fc, "attn_context", (H, S, d))
     expected = golden["attn_context"].float().numpy().reshape(H, S, d)
     errors = verify_buffer(
-        torch.from_numpy(actual).bfloat16(), "attn_context",
+        torch.from_numpy(actual).bfloat16(),
+        "attn_context",
         torch.from_numpy(expected).bfloat16().reshape(H, S, d),
-        rel_tol=REL_TOL, abs_tol=ABS_TOL, max_error_rate=MAX_ERROR_RATE,
+        rel_tol=REL_TOL,
+        abs_tol=ABS_TOL,
+        max_error_rate=MAX_ERROR_RATE,
     )
     assert not errors, f"Output verification failed with {len(errors)} errors"
 
@@ -135,6 +143,7 @@ def test_mha_pefill_lxl_sd(H, G, d, E, S):
 # ---------------------------------------------------------------------------
 # Projected attention tests (with Q/K/V projections + RoPE)
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.metrics(
     Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
@@ -172,6 +181,7 @@ def test_attention_prefill_projected_fused(H, G, d, E, S):
 # Benchmark: GPT-2 Small core MHA across sequence lengths, +/- causal mask
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.benchmark
 @pytest.mark.metrics(
     Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
@@ -207,7 +217,12 @@ def test_mha_prefill_benchmark(H, G, d, E, S, causal):
 
 INTERMEDIATE_CHECKS = [
     ("attn_scores", "attn_scores", lambda H, G, S, d: (H, S, S), "scratch"),
-    ("attn_scores_masked", "attn_scores_masked", lambda H, G, S, d: (H, S, S), "scratch"),
+    (
+        "attn_scores_masked",
+        "attn_scores_masked",
+        lambda H, G, S, d: (H, S, S),
+        "scratch",
+    ),
     ("attn_weights", "attn_weights", lambda H, G, S, d: (H, S, S), "scratch"),
     ("attn_context", "attn_context", lambda H, G, S, d: (H, S, d), "output"),
 ]

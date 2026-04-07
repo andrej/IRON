@@ -41,25 +41,46 @@ def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True):
     B = 2  # bytes per bf16 element
 
     gemm_scores = GEMM(
-        M=S, K=d, N=S, num_aie_columns=8, tile_m=16, tile_k=64,
-        tile_n=_pick_tile_n(S, 8), context=elf_ctx,
+        M=S,
+        K=d,
+        N=S,
+        num_aie_columns=8,
+        tile_m=16,
+        tile_k=64,
+        tile_n=_pick_tile_n(S, 8),
+        context=elf_ctx,
     )
     scale = ElementwiseMul(
-        size=H * S * S, tile_size=S * S // 8,
-        num_aie_columns=8, context=elf_ctx,
+        size=H * S * S,
+        tile_size=S * S // 8,
+        num_aie_columns=8,
+        context=elf_ctx,
     )
     if causal_mask:
         mask = ElementwiseAdd(
-            size=H * S * S, tile_size=S * S // 8,
-            num_aie_columns=8, context=elf_ctx,
+            size=H * S * S,
+            tile_size=S * S // 8,
+            num_aie_columns=8,
+            context=elf_ctx,
         )
     softmax = Softmax(
-        rows=H * S, cols=S, num_aie_columns=1, num_channels=1,
-        rtp_vector_size=S, context=elf_ctx,
+        rows=H * S,
+        cols=S,
+        num_aie_columns=1,
+        num_channels=1,
+        rtp_vector_size=S,
+        context=elf_ctx,
     )
     gemm_context = GEMM(
-        M=S, K=S, N=d, num_aie_columns=4, tile_m=16, tile_k=64,
-        tile_n=16, context=elf_ctx, prio_accuracy=True,
+        M=S,
+        K=S,
+        N=d,
+        num_aie_columns=4,
+        tile_m=16,
+        tile_k=64,
+        tile_n=16,
+        context=elf_ctx,
+        prio_accuracy=True,
     )
 
     qh = S * d * B
@@ -69,11 +90,15 @@ def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True):
     ch = S * d * B
 
     runlist = [
-        *[(gemm_scores,
-           f"queries[{h*qh}:{(h+1)*qh}]",
-           f"keys[{h*kdS}:{(h+1)*kdS}]",
-           f"attn_scores[{h*sh}:{(h+1)*sh}]")
-          for h in range(H)],
+        *[
+            (
+                gemm_scores,
+                f"queries[{h*qh}:{(h+1)*qh}]",
+                f"keys[{h*kdS}:{(h+1)*kdS}]",
+                f"attn_scores[{h*sh}:{(h+1)*sh}]",
+            )
+            for h in range(H)
+        ],
         (scale, "attn_scores", "attn_scale_factor", "attn_scores_scaled"),
     ]
 
@@ -88,11 +113,15 @@ def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True):
         ]
 
     runlist += [
-        *[(gemm_context,
-           f"attn_weights[{h*sh}:{(h+1)*sh}]",
-           f"values[{h*kSd}:{(h+1)*kSd}]",
-           f"attn_context[{h*ch}:{(h+1)*ch}]")
-          for h in range(H)],
+        *[
+            (
+                gemm_context,
+                f"attn_weights[{h*sh}:{(h+1)*sh}]",
+                f"values[{h*kSd}:{(h+1)*kSd}]",
+                f"attn_context[{h*ch}:{(h+1)*ch}]",
+            )
+            for h in range(H)
+        ],
     ]
 
     buffer_sizes = {
@@ -116,8 +145,16 @@ class AttentionPrefillFused(FusedMLIROperator):
     Accepts pre-projected Q (S*H,d), K (S*G,d), V (S*G,d) in interleaved layout.
     """
 
-    def __init__(self, num_heads, num_kv_groups, head_dim, embedding_dim,
-                 seq_len, causal_mask=True, context=None):
+    def __init__(
+        self,
+        num_heads,
+        num_kv_groups,
+        head_dim,
+        embedding_dim,
+        seq_len,
+        causal_mask=True,
+        context=None,
+    ):
         assert head_dim == 64
         assert num_heads % num_kv_groups == 0
         assert seq_len % 256 == 0
@@ -131,7 +168,11 @@ class AttentionPrefillFused(FusedMLIROperator):
 
         elf_ctx = context or AIEContext()
         runlist, buffer_sizes = _build_core_ops(
-            num_heads, num_kv_groups, head_dim, seq_len, elf_ctx,
+            num_heads,
+            num_kv_groups,
+            head_dim,
+            seq_len,
+            elf_ctx,
             causal_mask=causal_mask,
         )
 
@@ -156,8 +197,16 @@ class AttentionPrefillProjectedFused(FusedMLIROperator):
     Accepts raw input (S, E) and rope_angles (S, d).
     """
 
-    def __init__(self, num_heads, num_kv_groups, head_dim, embedding_dim,
-                 seq_len, causal_mask=True, context=None):
+    def __init__(
+        self,
+        num_heads,
+        num_kv_groups,
+        head_dim,
+        embedding_dim,
+        seq_len,
+        causal_mask=True,
+        context=None,
+    ):
         assert head_dim == 64
         assert num_heads % num_kv_groups == 0
         assert seq_len % 256 == 0
@@ -177,38 +226,73 @@ class AttentionPrefillProjectedFused(FusedMLIROperator):
 
         # ---- Projection + RoPE ----
         gemm_query = GEMM(
-            M=S, K=E, N=H * d, num_aie_columns=8, tile_m=16, tile_k=64,
-            tile_n=_pick_tile_n(H * d, 8), context=elf_ctx,
+            M=S,
+            K=E,
+            N=H * d,
+            num_aie_columns=8,
+            tile_m=16,
+            tile_k=64,
+            tile_n=_pick_tile_n(H * d, 8),
+            context=elf_ctx,
         )
         gemm_kv = GEMM(
-            M=S, K=E, N=G * d, num_aie_columns=8, tile_m=16, tile_k=64,
-            tile_n=_pick_tile_n(G * d, 8), context=elf_ctx,
+            M=S,
+            K=E,
+            N=G * d,
+            num_aie_columns=8,
+            tile_m=16,
+            tile_k=64,
+            tile_n=_pick_tile_n(G * d, 8),
+            context=elf_ctx,
         )
         rope_queries = RoPE(rows=S * H, cols=d, angle_rows=S, context=elf_ctx)
         rope_keys = RoPE(rows=S * G, cols=d, angle_rows=S, context=elf_ctx)
 
         # ---- Deinterleave ----
         deinterleave_q = StridedCopy(
-            input_sizes=(H, S, d), input_strides=(d, H * d, 1), input_offset=0,
-            output_sizes=(H, S, d), output_strides=(S * d, d, 1), output_offset=0,
-            input_buffer_size=S * H * d, output_buffer_size=H * S * d,
-            transfer_size=S * d, num_aie_channels=1, context=elf_ctx,
+            input_sizes=(H, S, d),
+            input_strides=(d, H * d, 1),
+            input_offset=0,
+            output_sizes=(H, S, d),
+            output_strides=(S * d, d, 1),
+            output_offset=0,
+            input_buffer_size=S * H * d,
+            output_buffer_size=H * S * d,
+            transfer_size=S * d,
+            num_aie_channels=1,
+            context=elf_ctx,
         )
         deinterleave_kv = StridedCopy(
-            input_sizes=(G, S, d), input_strides=(d, G * d, 1), input_offset=0,
-            output_sizes=(G, S, d), output_strides=(S * d, d, 1), output_offset=0,
-            input_buffer_size=S * G * d, output_buffer_size=G * S * d,
-            transfer_size=S * d, num_aie_channels=1, context=elf_ctx,
+            input_sizes=(G, S, d),
+            input_strides=(d, G * d, 1),
+            input_offset=0,
+            output_sizes=(G, S, d),
+            output_strides=(S * d, d, 1),
+            output_offset=0,
+            input_buffer_size=S * G * d,
+            output_buffer_size=G * S * d,
+            transfer_size=S * d,
+            num_aie_channels=1,
+            context=elf_ctx,
         )
 
         # ---- Transpose keys + GQA repeat ----
         transpose_keys = Transpose(
-            M=S, N=d, num_aie_columns=2, num_channels=1,
-            m=256, n=32, s=8, context=elf_ctx,
+            M=S,
+            N=d,
+            num_aie_columns=2,
+            num_channels=1,
+            m=256,
+            n=32,
+            s=8,
+            context=elf_ctx,
         )
         repeat_kv = Repeat(
-            rows=G, cols=d * S, repeat=group_size,
-            transfer_size=d, context=elf_ctx,
+            rows=G,
+            cols=d * S,
+            repeat=group_size,
+            transfer_size=d,
+            context=elf_ctx,
         )
 
         kSd = S * d * B
@@ -223,10 +307,14 @@ class AttentionPrefillProjectedFused(FusedMLIROperator):
             (deinterleave_q, "queries_roped", "queries"),
             (deinterleave_kv, "keys_roped", "keys_deint"),
             (deinterleave_kv, "values_projected", "values_deint"),
-            *[(transpose_keys,
-               f"keys_deint[{g*kSd}:{(g+1)*kSd}]",
-               f"keys_transposed[{g*kdS}:{(g+1)*kdS}]")
-              for g in range(G)],
+            *[
+                (
+                    transpose_keys,
+                    f"keys_deint[{g*kSd}:{(g+1)*kSd}]",
+                    f"keys_transposed[{g*kdS}:{(g+1)*kdS}]",
+                )
+                for g in range(G)
+            ],
             (repeat_kv, "keys_transposed", "keys"),
             (repeat_kv, "values_deint", "values"),
         ]
@@ -242,19 +330,38 @@ class AttentionPrefillProjectedFused(FusedMLIROperator):
         }
 
         core_runlist, core_buffer_sizes = _build_core_ops(
-            H, G, d, S, elf_ctx, causal_mask=causal_mask,
+            H,
+            G,
+            d,
+            S,
+            elf_ctx,
+            causal_mask=causal_mask,
         )
 
         # ---- Reinterleave + output projection ----
         reinterleave = StridedCopy(
-            input_sizes=(1, 1, 1, H * S * d), input_strides=(0, 0, 0, 1), input_offset=0,
-            output_sizes=(H, 256, S // 256, d), output_strides=(d, 256 * H * d, H * d, 1), output_offset=0,
-            input_buffer_size=H * S * d, output_buffer_size=S * H * d,
-            transfer_size=S * d, num_aie_channels=1, context=elf_ctx,
+            input_sizes=(1, 1, 1, H * S * d),
+            input_strides=(0, 0, 0, 1),
+            input_offset=0,
+            output_sizes=(H, 256, S // 256, d),
+            output_strides=(d, 256 * H * d, H * d, 1),
+            output_offset=0,
+            input_buffer_size=H * S * d,
+            output_buffer_size=S * H * d,
+            transfer_size=S * d,
+            num_aie_channels=1,
+            context=elf_ctx,
         )
         gemm_output = GEMM(
-            M=S, K=H * d, N=E, num_aie_columns=8, tile_m=16, tile_k=64,
-            tile_n=_pick_tile_n(E, 8), context=elf_ctx, prio_accuracy=True,
+            M=S,
+            K=H * d,
+            N=E,
+            num_aie_columns=8,
+            tile_m=16,
+            tile_k=64,
+            tile_n=_pick_tile_n(E, 8),
+            context=elf_ctx,
+            prio_accuracy=True,
         )
 
         suffix_runlist = [
@@ -266,8 +373,15 @@ class AttentionPrefillProjectedFused(FusedMLIROperator):
         }
 
         mask_suffix = "_causal" if causal_mask else "_nomask"
-        input_args = ["input", "rope_angles", "W_query", "W_key", "W_value",
-                       "W_output", "attn_scale_factor"]
+        input_args = [
+            "input",
+            "rope_angles",
+            "W_query",
+            "W_key",
+            "W_value",
+            "W_output",
+            "attn_scale_factor",
+        ]
         if causal_mask:
             input_args.append("causal_mask")
 
@@ -276,6 +390,10 @@ class AttentionPrefillProjectedFused(FusedMLIROperator):
             runlist=prefix_runlist + core_runlist + suffix_runlist,
             input_args=input_args,
             output_args=["attn_output"],
-            buffer_sizes={**prefix_buffer_sizes, **core_buffer_sizes, **suffix_buffer_sizes},
+            buffer_sizes={
+                **prefix_buffer_sizes,
+                **core_buffer_sizes,
+                **suffix_buffer_sizes,
+            },
             context=elf_ctx,
         )

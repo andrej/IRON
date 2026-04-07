@@ -314,7 +314,9 @@ def my_matmul(
             gemm_object,
             [C_l1_ty],
         )
-        matmul_func_name = f"{func_prefix}matmul{scalar_suffix}_{dtype_in_str}_{dtype_out_str}"
+        matmul_func_name = (
+            f"{func_prefix}matmul{scalar_suffix}_{dtype_in_str}_{dtype_out_str}"
+        )
         matmul_kernel = Kernel(
             matmul_func_name,
             gemm_object,
