@@ -25,13 +25,16 @@ def _pick_tile_n(N, num_cols, max_tile_n=64):
     return tile_n
 
 
-def _build_core_ops(H, G, d, E, S, elf_ctx, causal_mask=True):
+def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True):
     """Build core attention sub-ops and runlist (no projections/RoPE/GQA).
 
     Expects pre-processed inputs:
       queries: (H, S, d) deinterleaved, contiguous per head
       keys: (H, d, S) transposed and GQA-repeated
       values: (H, S, d) GQA-repeated
+
+    Produces:
+      attn_context: (H, S, d) — per-head context vectors
 
     If causal_mask=False, the elementwise-add masking step is omitted.
     """
@@ -57,18 +60,6 @@ def _build_core_ops(H, G, d, E, S, elf_ctx, causal_mask=True):
     gemm_context = AIEGEMM(
         M=S, K=S, N=d, num_aie_columns=4, tile_m=16, tile_k=64,
         tile_n=16, context=elf_ctx, prio_accuracy=True,
-    )
-    reinterleave = AIEStridedCopy(
-        #input_sizes=(H, S, d), input_strides=(S * d, d, 1), input_offset=0,
-        input_sizes=(1, 1, 1, H * S * d), input_strides=(0, 0, 0, 1), input_offset=0,
-        #output_sizes=(H, S, d), output_strides=(d, H * d, 1), output_offset=0,
-        output_sizes=(H, 256, S // 256, d), output_strides=(d, 256 * H * d, H * d, 1), output_offset=0,
-        input_buffer_size=H * S * d, output_buffer_size=S * H * d,
-        transfer_size=S * d, num_aie_channels=1, context=elf_ctx,
-    )
-    gemm_output = AIEGEMM(
-        M=S, K=H * d, N=E, num_aie_columns=8, tile_m=16, tile_k=64,
-        tile_n=_pick_tile_n(E, 8), context=elf_ctx, prio_accuracy=True,
     )
 
     qh = S * d * B
@@ -102,8 +93,6 @@ def _build_core_ops(H, G, d, E, S, elf_ctx, causal_mask=True):
            f"values[{h*kSd}:{(h+1)*kSd}]",
            f"attn_context[{h*ch}:{(h+1)*ch}]")
           for h in range(H)],
-        (reinterleave, "attn_context", "context_interleaved"),
-        (gemm_output, "context_interleaved", "W_output", "attn_output"),
     ]
 
     buffer_sizes = {
@@ -114,7 +103,6 @@ def _build_core_ops(H, G, d, E, S, elf_ctx, causal_mask=True):
         "attn_scores_scaled": H * S * S * B,
         "attn_weights": H * S * S * B,
         "attn_context": H * S * d * B,
-        "context_interleaved": S * H * d * B,
     }
     if causal_mask:
         buffer_sizes["attn_scores_masked"] = H * S * S * B
@@ -143,13 +131,12 @@ class AIEAttentionPrefillFused(FusedMLIROperator):
 
         elf_ctx = context or AIEContext()
         runlist, buffer_sizes = _build_core_ops(
-            num_heads, num_kv_groups, head_dim, embedding_dim, seq_len, elf_ctx,
+            num_heads, num_kv_groups, head_dim, seq_len, elf_ctx,
             causal_mask=causal_mask,
         )
 
         mask_suffix = "_causal" if causal_mask else "_nomask"
-        input_args = ["queries", "keys", "values",
-                       "W_output", "attn_scale_factor"]
+        input_args = ["queries", "keys", "values", "attn_scale_factor"]
         if causal_mask:
             input_args.append("causal_mask")
 
@@ -157,7 +144,7 @@ class AIEAttentionPrefillFused(FusedMLIROperator):
             name=f"attention_prefill_fused_{num_heads}h{num_kv_groups}g{head_dim}d{embedding_dim}e{seq_len}s{mask_suffix}",
             runlist=runlist,
             input_args=input_args,
-            output_args=["attn_output"],
+            output_args=["attn_context"],
             buffer_sizes=buffer_sizes,
             context=elf_ctx,
         )
@@ -255,8 +242,28 @@ class AIEAttentionPrefillProjectedFused(FusedMLIROperator):
         }
 
         core_runlist, core_buffer_sizes = _build_core_ops(
-            H, G, d, E, S, elf_ctx, causal_mask=causal_mask,
+            H, G, d, S, elf_ctx, causal_mask=causal_mask,
         )
+
+        # ---- Reinterleave + output projection ----
+        reinterleave = AIEStridedCopy(
+            input_sizes=(1, 1, 1, H * S * d), input_strides=(0, 0, 0, 1), input_offset=0,
+            output_sizes=(H, 256, S // 256, d), output_strides=(d, 256 * H * d, H * d, 1), output_offset=0,
+            input_buffer_size=H * S * d, output_buffer_size=S * H * d,
+            transfer_size=S * d, num_aie_channels=1, context=elf_ctx,
+        )
+        gemm_output = AIEGEMM(
+            M=S, K=H * d, N=E, num_aie_columns=8, tile_m=16, tile_k=64,
+            tile_n=_pick_tile_n(E, 8), context=elf_ctx, prio_accuracy=True,
+        )
+
+        suffix_runlist = [
+            (reinterleave, "attn_context", "context_interleaved"),
+            (gemm_output, "context_interleaved", "W_output", "attn_output"),
+        ]
+        suffix_buffer_sizes = {
+            "context_interleaved": S * H * d * B,
+        }
 
         mask_suffix = "_causal" if causal_mask else "_nomask"
         input_args = ["input", "rope_angles", "W_query", "W_key", "W_value",
@@ -266,9 +273,9 @@ class AIEAttentionPrefillProjectedFused(FusedMLIROperator):
 
         super().__init__(
             name=f"attention_prefill_projected_fused_{H}h{G}g{d}d{E}e{S}s{mask_suffix}",
-            runlist=prefix_runlist + core_runlist,
+            runlist=prefix_runlist + core_runlist + suffix_runlist,
             input_args=input_args,
             output_args=["attn_output"],
-            buffer_sizes={**prefix_buffer_sizes, **core_buffer_sizes},
+            buffer_sizes={**prefix_buffer_sizes, **core_buffer_sizes, **suffix_buffer_sizes},
             context=elf_ctx,
         )

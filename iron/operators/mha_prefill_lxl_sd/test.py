@@ -55,6 +55,16 @@ def _get_scratch_tensor(fc, name, shape):
     ).reshape(shape).astype(np.float32)
 
 
+def _get_output_tensor(fc, name, shape):
+    """Read a named buffer from the fused callable's output space."""
+    fc.output_buffer.on = "npu"
+    fc.output_buffer.to("cpu")
+    sub = fc.get_buffer(name)
+    return np.frombuffer(
+        sub.memory_view, dtype=bfloat16, count=int(np.prod(shape))
+    ).reshape(shape).astype(np.float32)
+
+
 def _verify_output(fc, golden, H, d, S, E):
     """Chain-consistent output verification shared by both test variants."""
     npu_context = torch.from_numpy(
@@ -78,15 +88,15 @@ def _core_gemm_flops(H, G, d, E, S):
     """Count GEMM FLOPs for the core attention operator."""
     score_flops = H * 2 * S * d * S       # H x (S,d)@(d,S)
     context_flops = H * 2 * S * S * d     # H x (S,S)@(S,d)
-    output_flops = 2 * S * (H * d) * E    # (S,H*d)@(H*d,E)
-    return score_flops + context_flops + output_flops
+    return score_flops + context_flops
 
 
 def _projected_gemm_flops(H, G, d, E, S):
     """Count GEMM FLOPs for the projected attention operator."""
     query_proj = 2 * S * E * (H * d)      # (S,E)@(E,H*d)
     kv_proj = 2 * (2 * S * E * (G * d))   # key + value: (S,E)@(E,G*d) each
-    return query_proj + kv_proj + _core_gemm_flops(H, G, d, E, S)
+    output_proj = 2 * S * (H * d) * E     # (S,H*d)@(H*d,E)
+    return query_proj + kv_proj + _core_gemm_flops(H, G, d, E, S) + output_proj
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +109,7 @@ def _projected_gemm_flops(H, G, d, E, S):
 )
 @pytest.mark.parametrize("H,G,d,E,S", get_params())
 def test_mha_pefill_lxl_sd(H, G, d, E, S):
-    """Core attention: score GEMM -> scale -> mask -> softmax -> context GEMM -> output."""
+    """Core attention: score GEMM -> scale -> mask -> softmax -> context GEMM."""
     golden = generate_golden_reference(H, G, d, E, S)
 
     op = AIEAttentionPrefillFused(H, G, d, E, S)
@@ -109,7 +119,6 @@ def test_mha_pefill_lxl_sd(H, G, d, E, S):
     _load_input(fc, "queries", golden["queries_deinterleaved"])
     _load_input(fc, "keys", golden["keys_for_scores"])
     _load_input(fc, "values", golden["values_for_context"])
-    _load_input(fc, "W_output", golden["W_output"])
     _load_input(fc, "attn_scale_factor", golden["attn_scale_factor"])
     _load_input(fc, "causal_mask", golden["causal_mask"])
 
@@ -120,7 +129,14 @@ def test_mha_pefill_lxl_sd(H, G, d, E, S):
     print(f"\nLatency (us): {latency_us:.1f}")
     print(f"Throughput: {gflops:.6e} GFLOP/s")
 
-    _verify_output(fc, golden, H, d, S, E)
+    actual = _get_output_tensor(fc, "attn_context", (H, S, d))
+    expected = golden["attn_context"].float().numpy().reshape(H, S, d)
+    errors = verify_buffer(
+        torch.from_numpy(actual).bfloat16(), "attn_context",
+        torch.from_numpy(expected).bfloat16().reshape(H, S, d),
+        rel_tol=REL_TOL, abs_tol=ABS_TOL, max_error_rate=MAX_ERROR_RATE,
+    )
+    assert not errors, f"Output verification failed with {len(errors)} errors"
 
 
 # ---------------------------------------------------------------------------
@@ -180,7 +196,6 @@ def test_mha_prefill_benchmark(H, G, d, E, S, causal):
     _load_input(fc, "queries", golden["queries_deinterleaved"])
     _load_input(fc, "keys", golden["keys_for_scores"])
     _load_input(fc, "values", golden["values_for_context"])
-    _load_input(fc, "W_output", golden["W_output"])
     _load_input(fc, "attn_scale_factor", golden["attn_scale_factor"])
     if causal:
         _load_input(fc, "causal_mask", golden["causal_mask"])
@@ -198,11 +213,10 @@ def test_mha_prefill_benchmark(H, G, d, E, S, causal):
 # ---------------------------------------------------------------------------
 
 INTERMEDIATE_CHECKS = [
-    ("attn_scores", "attn_scores", lambda H, G, S, d: (H, S, S)),
-    ("attn_scores_masked", "attn_scores_masked", lambda H, G, S, d: (H, S, S)),
-    ("attn_weights", "attn_weights", lambda H, G, S, d: (H, S, S)),
-    ("attn_context", "attn_context", lambda H, G, S, d: (H, S, d)),
-    ("context_interleaved", "context_interleaved", lambda H, G, S, d: (S, H * d)),
+    ("attn_scores", "attn_scores", lambda H, G, S, d: (H, S, S), "scratch"),
+    ("attn_scores_masked", "attn_scores_masked", lambda H, G, S, d: (H, S, S), "scratch"),
+    ("attn_weights", "attn_weights", lambda H, G, S, d: (H, S, S), "scratch"),
+    ("attn_context", "attn_context", lambda H, G, S, d: (H, S, d), "output"),
 ]
 
 
@@ -219,15 +233,17 @@ def test_mha_pefill_lxl_sd_intermediates(H, G, d, E, S):
     _load_input(fc, "queries", golden["queries_deinterleaved"])
     _load_input(fc, "keys", golden["keys_for_scores"])
     _load_input(fc, "values", golden["values_for_context"])
-    _load_input(fc, "W_output", golden["W_output"])
     _load_input(fc, "attn_scale_factor", golden["attn_scale_factor"])
     _load_input(fc, "causal_mask", golden["causal_mask"])
 
     fc()
 
-    for buf_name, golden_key, shape_fn in INTERMEDIATE_CHECKS:
+    for buf_name, golden_key, shape_fn, buf_type in INTERMEDIATE_CHECKS:
         shape = shape_fn(H, G, S, d)
-        actual = _get_scratch_tensor(fc, buf_name, shape)
+        if buf_type == "output":
+            actual = _get_output_tensor(fc, buf_name, shape)
+        else:
+            actual = _get_scratch_tensor(fc, buf_name, shape)
         expected = golden[golden_key].float().numpy().reshape(shape)
         diff = np.abs(actual - expected)
         print(
