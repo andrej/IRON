@@ -33,8 +33,13 @@ def get_benchmark_params():
     S = 256
     while S <= 4096: #32768:
         for mask in [True, False]:
-            tag = "causal" if mask else "nomask"
-            params.append(pytest.param(12, 12, 64, 768, S, mask, id=f"GPT2-S{S}-{tag}"))
+            for dispatch in ["auto", "separate"]:
+                tag = "causal" if mask else "nomask"
+                suffix = f"-{dispatch}" if dispatch != "auto" else ""
+                params.append(pytest.param(
+                    12, 12, 64, 768, S, mask, dispatch,
+                    id=f"GPT2-S{S}-{tag}{suffix}",
+                ))
         S *= 2
     return params
 
@@ -187,12 +192,12 @@ def test_attention_prefill_projected_fused(H, G, d, E, S):
     Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
     Throughput=r"Throughput: (?P<value>[\d\.e\+-]+) GFLOP/s",
 )
-@pytest.mark.parametrize("H,G,d,E,S,causal", get_benchmark_params())
-def test_mha_prefill_benchmark(H, G, d, E, S, causal):
+@pytest.mark.parametrize("H,G,d,E,S,causal,dispatch", get_benchmark_params())
+def test_mha_prefill_benchmark(H, G, d, E, S, causal, dispatch):
     """Benchmark core MHA for GPT-2 Small across sequence lengths."""
     golden = generate_golden_reference(H, G, d, E, S)
 
-    op = AttentionPrefillFused(H, G, d, E, S, causal_mask=causal)
+    op = AttentionPrefillFused(H, G, d, E, S, causal_mask=causal, dispatch=dispatch)
     op.compile()
     fc = op.get_callable()
 

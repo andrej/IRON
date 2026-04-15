@@ -158,6 +158,7 @@ class AttentionPrefillFused(FusedMLIROperator):
         seq_len,
         causal_mask=True,
         context=None,
+        dispatch="auto",
     ):
         assert head_dim == 64
         assert num_heads % num_kv_groups == 0
@@ -191,6 +192,7 @@ class AttentionPrefillFused(FusedMLIROperator):
             input_args=input_args,
             output_args=["attn_context"],
             buffer_sizes=buffer_sizes,
+            dispatch=dispatch,
             context=elf_ctx,
         )
 
@@ -210,6 +212,7 @@ class AttentionPrefillProjectedFused(FusedMLIROperator):
         seq_len,
         causal_mask=True,
         context=None,
+        dispatch="auto",
     ):
         assert head_dim == 64
         assert num_heads % num_kv_groups == 0
@@ -221,6 +224,7 @@ class AttentionPrefillProjectedFused(FusedMLIROperator):
         self.head_dim = head_dim
         self.embedding_dim = embedding_dim
         self.seq_len = seq_len
+        self._dispatch_arg = dispatch
 
         H, G, d, E, S = num_heads, num_kv_groups, head_dim, embedding_dim, seq_len
         group_size = H // G
@@ -401,5 +405,6 @@ class AttentionPrefillProjectedFused(FusedMLIROperator):
                 **core_buffer_sizes,
                 **suffix_buffer_sizes,
             },
+            dispatch=dispatch,
             context=elf_ctx,
         )
