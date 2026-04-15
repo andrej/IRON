@@ -67,12 +67,17 @@ def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True, num_cols=None):
             num_aie_columns=num_cols,
             context=elf_ctx,
         )
+    # Use online/partial softmax when full-row tiles would exhaust AIE local
+    # memory (each double-buffered FIFO pair uses 4 * tile_size bytes; at
+    # S >= 8192 the in+out FIFOs alone consume the full 64 KB data memory).
+    softmax_chunk_size = 1024 if S >= 8192 else None
     softmax = Softmax(
         rows=H * S,
         cols=S,
         num_aie_columns=1,
         num_channels=1,
         rtp_vector_size=S,
+        chunk_size=softmax_chunk_size,
         context=elf_ctx,
     )
     gemm_context = GEMM(

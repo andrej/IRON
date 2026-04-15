@@ -31,7 +31,7 @@ def get_benchmark_params():
     """GPT-2 Small across sequence lengths 256..32768, with/without causal mask."""
     params = []
     S = 256
-    while S <= 4096: #32768:
+    while S <= 8192:
         for mask in [True, False]:
             for dispatch in ["auto", "separate"]:
                 tag = "causal" if mask else "nomask"
