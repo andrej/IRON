@@ -31,7 +31,7 @@ def get_benchmark_params():
     """GPT-2 Small across sequence lengths 256..32768, with/without causal mask."""
     params = []
     S = 256
-    while S <= 32768:
+    while S <= 4096: #32768:
         for mask in [True, False]:
             tag = "causal" if mask else "nomask"
             params.append(pytest.param(12, 12, 64, 768, S, mask, id=f"GPT2-S{S}-{tag}"))

@@ -5,6 +5,8 @@
 A layer-by-layer (LxL) single-dispatch (SD) implementation of multi-head attention (MHA).
 """
 
+import aie.utils as aie_utils
+
 from iron.common.context import AIEContext
 from iron.common.fusion import FusedMLIROperator
 from iron.operators.gemm.op import GEMM
@@ -25,7 +27,7 @@ def _pick_tile_n(N, num_cols, max_tile_n=64):
     return tile_n
 
 
-def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True):
+def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True, num_cols=None):
     """Build core attention sub-ops and runlist (no projections/RoPE/GQA).
 
     Expects pre-processed inputs:
@@ -38,29 +40,31 @@ def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True):
 
     If causal_mask=False, the elementwise-add masking step is omitted.
     """
+    if num_cols is None:
+        num_cols = aie_utils.get_current_device().cols
     B = 2  # bytes per bf16 element
 
     gemm_scores = GEMM(
         M=S,
         K=d,
         N=S,
-        num_aie_columns=8,
+        num_aie_columns=num_cols,
         tile_m=16,
         tile_k=64,
-        tile_n=_pick_tile_n(S, 8),
+        tile_n=_pick_tile_n(S, num_cols),
         context=elf_ctx,
     )
     scale = ElementwiseMul(
         size=H * S * S,
-        tile_size=S * S // 8,
-        num_aie_columns=8,
+        tile_size=S * S // num_cols,
+        num_aie_columns=num_cols,
         context=elf_ctx,
     )
     if causal_mask:
         mask = ElementwiseAdd(
             size=H * S * S,
-            tile_size=S * S // 8,
-            num_aie_columns=8,
+            tile_size=S * S // num_cols,
+            num_aie_columns=num_cols,
             context=elf_ctx,
         )
     softmax = Softmax(
@@ -75,10 +79,10 @@ def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True):
         M=S,
         K=S,
         N=d,
-        num_aie_columns=4,
+        num_aie_columns=min(4, num_cols),
         tile_m=16,
         tile_k=64,
-        tile_n=16,
+        tile_n=_pick_tile_n(d, min(4, num_cols)),
         context=elf_ctx,
         prio_accuracy=True,
     )
@@ -221,6 +225,7 @@ class AttentionPrefillProjectedFused(FusedMLIROperator):
         H, G, d, E, S = num_heads, num_kv_groups, head_dim, embedding_dim, seq_len
         group_size = H // G
         B = 2
+        num_cols = aie_utils.get_current_device().cols
 
         elf_ctx = context or AIEContext()
 
@@ -229,20 +234,20 @@ class AttentionPrefillProjectedFused(FusedMLIROperator):
             M=S,
             K=E,
             N=H * d,
-            num_aie_columns=8,
+            num_aie_columns=num_cols,
             tile_m=16,
             tile_k=64,
-            tile_n=_pick_tile_n(H * d, 8),
+            tile_n=_pick_tile_n(H * d, num_cols),
             context=elf_ctx,
         )
         gemm_kv = GEMM(
             M=S,
             K=E,
             N=G * d,
-            num_aie_columns=8,
+            num_aie_columns=num_cols,
             tile_m=16,
             tile_k=64,
-            tile_n=_pick_tile_n(G * d, 8),
+            tile_n=_pick_tile_n(G * d, num_cols),
             context=elf_ctx,
         )
         rope_queries = RoPE(rows=S * H, cols=d, angle_rows=S, context=elf_ctx)
@@ -336,6 +341,7 @@ class AttentionPrefillProjectedFused(FusedMLIROperator):
             S,
             elf_ctx,
             causal_mask=causal_mask,
+            num_cols=num_cols,
         )
 
         # ---- Reinterleave + output projection ----
@@ -356,10 +362,10 @@ class AttentionPrefillProjectedFused(FusedMLIROperator):
             M=S,
             K=H * d,
             N=E,
-            num_aie_columns=8,
+            num_aie_columns=num_cols,
             tile_m=16,
             tile_k=64,
-            tile_n=_pick_tile_n(E, 8),
+            tile_n=_pick_tile_n(E, num_cols),
             context=elf_ctx,
             prio_accuracy=True,
         )
