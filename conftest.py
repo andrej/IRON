@@ -59,6 +59,14 @@ class CSVReporter:
         self.commit = get_git_commit()
         self.date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.test_metrics = {}  # test_name -> {metric_name -> [values]}
+        self._initialize_csv()
+
+    def _initialize_csv(self):
+        """Initialize CSV file - will be written incrementally as tests complete"""
+        self.csv_path.parent.mkdir(parents=True, exist_ok=True)
+        # Clear the file at the start of a new test run
+        with open(self.csv_path, "w", newline="") as f:
+            pass  # Create empty file, header will be written with first result
 
     def add_result(self, test_name, passed, captured_output, metric_patterns):
         self.test_metrics.setdefault(test_name, {}).setdefault("passed", []).append(
@@ -72,40 +80,70 @@ class CSVReporter:
             value = float(match.group("value"))
             self.test_metrics[test_name].setdefault(metric_name, []).append(value)
 
-    def finalize_results(self):
-        """Compute statistics for all collected metrics"""
-        for test_name, data in self.test_metrics.items():
-            row = {
-                "Commit": self.commit,
-                "Date": self.date,
-                "Test": test_name,
-                "Checks": f"{sum(data['passed'])}/{len(data['passed'])}",
-            }
-            for metric_name, values in data.items():
-                if metric_name == "passed":
-                    continue
-                if values:
-                    row[f"{metric_name} (mean)"] = statistics.mean(values)
-                    row[f"{metric_name} (median)"] = statistics.median(values)
-                    row[f"{metric_name} (min)"] = min(values)
-                    row[f"{metric_name} (max)"] = max(values)
-                    row[f"{metric_name} (stddev)"] = (
-                        statistics.stdev(values) if len(values) > 1 else 0.0
-                    )
+    def _compute_row(self, test_name, data):
+        """Compute statistics row for a single test"""
+        row = {
+            "Commit": self.commit,
+            "Date": self.date,
+            "Test": test_name,
+            "Checks": f"{sum(data['passed'])}/{len(data['passed'])}",
+        }
+        for metric_name, values in data.items():
+            if metric_name == "passed":
+                continue
+            if values:
+                row[f"{metric_name} (mean)"] = statistics.mean(values)
+                row[f"{metric_name} (median)"] = statistics.median(values)
+                row[f"{metric_name} (min)"] = min(values)
+                row[f"{metric_name} (max)"] = max(values)
+                row[f"{metric_name} (stddev)"] = (
+                    statistics.stdev(values) if len(values) > 1 else 0.0
+                )
+        return row
+
+    def write_test_result(self, test_name):
+        """Write or update result for a specific test incrementally"""
+        if test_name not in self.test_metrics:
+            return
+
+        data = self.test_metrics[test_name]
+        row = self._compute_row(test_name, data)
+
+        # Update or add to results
+        existing_idx = None
+        for idx, existing_row in enumerate(self.results):
+            if existing_row["Test"] == test_name:
+                existing_idx = idx
+                break
+
+        if existing_idx is not None:
+            self.results[existing_idx] = row
+        else:
             self.results.append(row)
 
-    def write_csv(self):
-        self.results.sort(key=lambda x: (x["Test"], x["Date"]))
+        # Rewrite entire CSV to handle column changes and updates
+        self._write_csv_internal()
+
+    def _write_csv_internal(self):
+        """Internal method to write CSV file"""
+        if not self.results:
+            return
+
+        sorted_results = sorted(self.results, key=lambda x: (x["Test"], x["Date"]))
 
         cols = {}
-        for row in self.results:
+        for row in sorted_results:
             cols.update({k: None for k in row.keys()})
 
         self.csv_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.csv_path, "w", newline="") as f:
             writer = csv.DictWriter(f, cols.keys())
             writer.writeheader()
-            writer.writerows(self.results)
+            writer.writerows(sorted_results)
+
+    def write_csv(self):
+        """Final write at session end - ensures all results are flushed"""
+        self._write_csv_internal()
 
 
 # Initialize the CSV writer once at test session setup
@@ -147,6 +185,9 @@ def pytest_runtest_makereport(item, call):
 
             csv_reporter.add_result(test_name, passed, captured, metric_patterns)
 
+            # Write results incrementally after each test
+            csv_reporter.write_test_result(test_name)
+
 
 def pytest_configure(config):
     csv_path = config.getoption("--csv-output")
@@ -170,7 +211,6 @@ def pytest_collection_modifyitems(config, items):
 
 def pytest_sessionfinish(session, exitstatus):
     if hasattr(session.config, "_csv_reporter"):
-        session.config._csv_reporter.finalize_results()
         session.config._csv_reporter.write_csv()
 
 
