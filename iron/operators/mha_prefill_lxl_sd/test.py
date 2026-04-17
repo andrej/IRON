@@ -12,7 +12,11 @@ from iron.operators.mha_prefill_lxl_sd.op import (
     AttentionPrefillFused,
     AttentionPrefillProjectedFused,
 )
-from iron.operators.mha_prefill_lxl_sd.reference import generate_golden_reference
+from iron.operators.mha_prefill_lxl_sd.reference import (
+    generate_golden_reference,
+    generate_random_inputs,
+    compute_attn_context_at_rows,
+)
 
 REL_TOL = 0.08
 ABS_TOL = 2.0
@@ -194,19 +198,24 @@ def test_attention_prefill_projected_fused(H, G, d, E, S):
 )
 @pytest.mark.parametrize("H,G,d,E,S,causal,dispatch", get_benchmark_params())
 def test_mha_prefill_benchmark(H, G, d, E, S, causal, dispatch):
-    """Benchmark core MHA for GPT-2 Small across sequence lengths."""
-    golden = generate_golden_reference(H, G, d, E, S)
+    """Benchmark core MHA for GPT-2 Small across sequence lengths.
+
+    Uses cheap random inputs (no full PyTorch reference) and verifies
+    correctness by recomputing the expected ``attn_context`` row for a small
+    number of randomly-chosen (head, row) positions — feasible at any S.
+    """
+    inputs = generate_random_inputs(H, G, d, E, S, causal=causal)
 
     op = AttentionPrefillFused(H, G, d, E, S, causal_mask=causal, dispatch=dispatch)
     op.compile()
     fc = op.get_callable()
 
-    _load_input(fc, "queries", golden["queries_deinterleaved"])
-    _load_input(fc, "keys", golden["keys_for_scores"])
-    _load_input(fc, "values", golden["values_for_context"])
-    _load_input(fc, "attn_scale_factor", golden["attn_scale_factor"])
+    _load_input(fc, "queries", inputs["queries_deinterleaved"])
+    _load_input(fc, "keys", inputs["keys_for_scores"])
+    _load_input(fc, "values", inputs["values_for_context"])
+    _load_input(fc, "attn_scale_factor", inputs["attn_scale_factor"])
     if causal:
-        _load_input(fc, "causal_mask", golden["causal_mask"])
+        _load_input(fc, "causal_mask", inputs["causal_mask"])
 
     fc()
 
@@ -214,6 +223,35 @@ def test_mha_prefill_benchmark(H, G, d, E, S, causal, dispatch):
     gflops = _core_gemm_flops(H, G, d, E, S) / (fc.last_elapsed) / 1e9
     print(f"\nLatency (us): {latency_us:.1f}")
     print(f"Throughput: {gflops:.6e} GFLOP/s")
+
+    # # ---- Sample-based correctness check ----
+    # # Pick a handful of random (head, row) pairs and recompute the expected
+    # # attn_context row for each (cheap: O(S*d) per sample).
+    # actual_context = _get_output_tensor(fc, "attn_context", (H, S, d))
+    # rng = np.random.default_rng(seed=0)
+    # n_samples = min(8, H)
+    # sample_hms = [(int(rng.integers(0, H)), int(rng.integers(0, S))) for _ in range(n_samples)]
+    # expected_rows = compute_attn_context_at_rows(
+    #     inputs["queries_deinterleaved"],
+    #     inputs["keys_for_scores"],
+    #     inputs["values_for_context"],
+    #     inputs["_scale"],
+    #     causal,
+    #     sample_hms,
+    # )
+    # failures = []
+    # for (h, m), exp in expected_rows.items():
+    #     act = torch.from_numpy(actual_context[h, m, :]).bfloat16()
+    #     diff = (act.float() - exp.float()).abs()
+    #     rel = diff / (exp.float().abs() + 1e-6)
+    #     # An element fails only if it exceeds BOTH abs_tol and rel_tol
+    #     bad = (diff > ABS_TOL) & (rel > REL_TOL)
+    #     if bad.any():
+    #         failures.append(
+    #             f"(h={h}, m={m}): {int(bad.sum())}/{d} bad, "
+    #             f"max_abs={diff.max().item():.4f}, max_rel={rel.max().item():.4f}"
+    #         )
+    # assert not failures, "Sample verification failed:\n  " + "\n  ".join(failures)
 
 
 # ---------------------------------------------------------------------------

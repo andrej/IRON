@@ -44,8 +44,29 @@ def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True, num_cols=None):
         num_cols = aie_utils.get_current_device().cols
     B = 2  # bytes per bf16 element
 
+    # ---- M-splitting for the per-head GEMMs ----
+    # At very long sequence lengths the per-GEMM design's runtime sequence
+    # (number of `rt.fill`/`rt.drain` MLIR ops) grows linearly with M, which
+    # makes each sub-operator's MLIR module very large and can OOM the
+    # compiler at S >= 16K.  We cap each GEMM invocation's M dimension at
+    # `gemm_M_chunk` and split the per-head computation into multiple
+    # back-to-back GEMM invocations with sliced buffer offsets.  Single
+    # dispatch is preserved (same fused runlist, just with more entries).
+    #
+    # M_chunk must be a multiple of `tile_m * n_aie_rows = 64` and must
+    # divide S evenly.  At min(S, 4096) we get:
+    #   S <= 4096:  1 invocation per head per phase (no splitting)
+    #   S = 8192:   2 invocations per head per phase
+    #   S = 16384:  4 invocations per head per phase
+    #   S = 32768:  8 invocations per head per phase
+    gemm_M_chunk = min(S, 4096)
+    assert S % gemm_M_chunk == 0, (
+        f"S ({S}) must be a multiple of gemm_M_chunk ({gemm_M_chunk})"
+    )
+    n_m_chunks = S // gemm_M_chunk
+
     gemm_scores = GEMM(
-        M=S,
+        M=gemm_M_chunk,
         K=d,
         N=S,
         num_aie_columns=num_cols,
@@ -71,8 +92,43 @@ def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True, num_cols=None):
     # memory (each double-buffered FIFO pair uses 4 * tile_size bytes; at
     # S >= 8192 the in+out FIFOs alone consume the full 64 KB data memory).
     softmax_chunk_size = 1024 if S >= 8192 else None
+
+    # ---- Row-splitting for the softmax invocation ----
+    # The shim DMA BD length field is a 32-bit unsigned word count (~4.29 B
+    # words ≈ 17 GB), but the current compiler lowering computes the BD length
+    # in bytes through int32 arithmetic and silently overflows when a single
+    # invocation's transfer exceeds 2 GB (= 2^31 bytes = 2^30 bf16 elements).
+    # We split the softmax call into N back-to-back invocations on disjoint
+    # row ranges to keep each transfer under that effective limit.  The
+    # softmax buffers (attn_scores_masked / attn_scores_scaled / attn_weights)
+    # are row-major (S, S) per head, so a contiguous row-range slice maps
+    # directly to a contiguous byte range.
+    # Strict bound: bytes per BD must fit in signed int32 (< 2^31), so the
+    # per-invocation element count must be strictly less than 2^30.
+    SOFTMAX_MAX_ELEMENTS_PER_INV = (1 << 30) - 1
+    total_softmax_rows = H * S
+    if total_softmax_rows * S <= SOFTMAX_MAX_ELEMENTS_PER_INV:
+        n_softmax_invocations = 1
+    else:
+        # Smallest n that simultaneously divides total_softmax_rows evenly
+        # AND keeps each invocation's transfer at or below the limit.
+        n_softmax_invocations = (
+            total_softmax_rows * S + SOFTMAX_MAX_ELEMENTS_PER_INV - 1
+        ) // SOFTMAX_MAX_ELEMENTS_PER_INV
+        while (
+            total_softmax_rows % n_softmax_invocations != 0
+            or (total_softmax_rows // n_softmax_invocations) * S
+            > SOFTMAX_MAX_ELEMENTS_PER_INV
+        ):
+            n_softmax_invocations += 1
+    softmax_rows_per_inv = total_softmax_rows // n_softmax_invocations
+    assert softmax_rows_per_inv % 16 == 0, (
+        f"softmax_rows_per_inv ({softmax_rows_per_inv}) must be a multiple of 16; "
+        f"got total_rows={total_softmax_rows}, n_invocations={n_softmax_invocations}"
+    )
+
     softmax = Softmax(
-        rows=H * S,
+        rows=softmax_rows_per_inv,
         cols=S,
         num_aie_columns=1,
         num_channels=1,
@@ -81,7 +137,7 @@ def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True, num_cols=None):
         context=elf_ctx,
     )
     gemm_context = GEMM(
-        M=S,
+        M=gemm_M_chunk,
         K=S,
         N=d,
         num_aie_columns=min(4, num_cols),
@@ -92,46 +148,69 @@ def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True, num_cols=None):
         prio_accuracy=True,
     )
 
-    qh = S * d * B
-    kdS = d * S * B
-    kSd = S * d * B
-    sh = S * S * B
-    ch = S * d * B
+    # Per-head byte sizes
+    qh = S * d * B          # queries per head: (S, d)
+    kdS = d * S * B         # keys per head:    (d, S)
+    kSd = S * d * B         # values per head:  (S, d)
+    sh = S * S * B          # scores/weights per head: (S, S)
+    ch = S * d * B          # context per head: (S, d)
+
+    # Per-M-chunk byte sizes (the M dimension is contiguous in row-major
+    # storage so M-slices map directly to byte ranges within each head)
+    q_chunk = gemm_M_chunk * d * B          # queries chunk: (M_chunk, d)
+    s_chunk = gemm_M_chunk * S * B          # scores chunk:  (M_chunk, S)
+    w_chunk = gemm_M_chunk * S * B          # weights chunk: (M_chunk, S)
+    c_chunk = gemm_M_chunk * d * B          # context chunk: (M_chunk, d)
+
+    score_calls = [
+        (
+            gemm_scores,
+            f"queries[{h*qh + i*q_chunk}:{h*qh + (i+1)*q_chunk}]",
+            f"keys[{h*kdS}:{(h+1)*kdS}]",
+            f"attn_scores[{h*sh + i*s_chunk}:{h*sh + (i+1)*s_chunk}]",
+        )
+        for h in range(H)
+        for i in range(n_m_chunks)
+    ]
+
+    context_calls = [
+        (
+            gemm_context,
+            f"attn_weights[{h*sh + i*w_chunk}:{h*sh + (i+1)*w_chunk}]",
+            f"values[{h*kSd}:{(h+1)*kSd}]",
+            f"attn_context[{h*ch + i*c_chunk}:{h*ch + (i+1)*c_chunk}]",
+        )
+        for h in range(H)
+        for i in range(n_m_chunks)
+    ]
+
+    # Build the softmax runlist entries (one per invocation when row-split).
+    softmax_input_buf = "attn_scores_masked" if causal_mask else "attn_scores_scaled"
+    softmax_chunk_bytes = softmax_rows_per_inv * S * B
+    if n_softmax_invocations == 1:
+        softmax_calls = [(softmax, softmax_input_buf, "attn_weights")]
+    else:
+        softmax_calls = [
+            (
+                softmax,
+                f"{softmax_input_buf}[{i*softmax_chunk_bytes}:{(i+1)*softmax_chunk_bytes}]",
+                f"attn_weights[{i*softmax_chunk_bytes}:{(i+1)*softmax_chunk_bytes}]",
+            )
+            for i in range(n_softmax_invocations)
+        ]
 
     runlist = [
-        *[
-            (
-                gemm_scores,
-                f"queries[{h*qh}:{(h+1)*qh}]",
-                f"keys[{h*kdS}:{(h+1)*kdS}]",
-                f"attn_scores[{h*sh}:{(h+1)*sh}]",
-            )
-            for h in range(H)
-        ],
+        *score_calls,
         (scale, "attn_scores", "attn_scale_factor", "attn_scores_scaled"),
     ]
 
     if causal_mask:
         runlist += [
             (mask, "attn_scores_scaled", "causal_mask", "attn_scores_masked"),
-            (softmax, "attn_scores_masked", "attn_weights"),
-        ]
-    else:
-        runlist += [
-            (softmax, "attn_scores_scaled", "attn_weights"),
         ]
 
-    runlist += [
-        *[
-            (
-                gemm_context,
-                f"attn_weights[{h*sh}:{(h+1)*sh}]",
-                f"values[{h*kSd}:{(h+1)*kSd}]",
-                f"attn_context[{h*ch}:{(h+1)*ch}]",
-            )
-            for h in range(H)
-        ],
-    ]
+    runlist += softmax_calls
+    runlist += context_calls
 
     buffer_sizes = {
         "queries": H * S * d * B,

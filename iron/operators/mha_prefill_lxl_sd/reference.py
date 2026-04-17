@@ -4,6 +4,97 @@
 import torch
 
 
+def generate_random_inputs(H, G, d, E, S, causal=True, seed=42):
+    """Generate just the *inputs* needed for the core MHA attention test, with
+    no expensive PyTorch reference computation.
+
+    Suitable for the benchmark test (which doesn't verify the full output) and
+    for very large sequence lengths where the full golden reference is
+    impractical.  The causal mask is built with a single ``torch.triu`` instead
+    of the H*S² nested-loop construction in :func:`generate_golden_reference`.
+
+    Returned dict matches the input keys consumed by the benchmark test
+    (``queries_deinterleaved``, ``keys_for_scores``, ``values_for_context``,
+    ``attn_scale_factor``, ``causal_mask``), plus ``_scale`` (the scalar
+    1/sqrt(d)) and ``_causal`` (the bool flag) for use by sample verification.
+    """
+    torch.manual_seed(seed)
+    val_range = 0.5
+
+    # Pre-deinterleaved/transposed/repeated Q, K, V (the layout the
+    # AttentionPrefillFused operator consumes directly).
+    queries_deinterleaved = (torch.randn(H, S, d) * val_range).to(torch.bfloat16)
+    keys_for_scores = (torch.randn(H, d, S) * val_range).to(torch.bfloat16)
+    values_for_context = (torch.randn(H, S, d) * val_range).to(torch.bfloat16)
+
+    scale = 1.0 / (d**0.5)
+    attn_scale_factor = torch.full((H * S * S,), scale, dtype=torch.bfloat16)
+
+    out = {
+        "queries_deinterleaved": queries_deinterleaved,
+        "keys_for_scores": keys_for_scores,
+        "values_for_context": values_for_context,
+        "attn_scale_factor": attn_scale_factor,
+        "_scale": scale,
+        "_causal": causal,
+    }
+
+    if causal:
+        # Vectorized causal mask: -inf strictly above the diagonal, broadcast
+        # across all H heads.  Shape (H*S, S) to match the operator layout.
+        single_mask = torch.triu(
+            torch.full((S, S), float("-inf"), dtype=torch.bfloat16),
+            diagonal=1,
+        )
+        out["causal_mask"] = (
+            single_mask.unsqueeze(0).expand(H, -1, -1).reshape(H * S, S).contiguous()
+        )
+
+    return out
+
+
+def compute_attn_context_at_rows(
+    queries_deinterleaved,
+    keys_for_scores,
+    values_for_context,
+    scale,
+    causal,
+    sample_hms,
+):
+    """Compute the expected ``attn_context[h, m, :]`` row for each (h, m) in
+    ``sample_hms``.
+
+    Cheap even at very large S: per sample is O(S * d) — a single (1, d) @ (d, S)
+    matmul plus an O(S) softmax plus an (S,) @ (S, d) reduction.
+
+    Args:
+        queries_deinterleaved: (H, S, d) bfloat16 tensor
+        keys_for_scores:       (H, d, S) bfloat16 tensor
+        values_for_context:    (H, S, d) bfloat16 tensor
+        scale:                 1 / sqrt(d) (Python float)
+        causal:                bool — apply causal mask (zero out k > m)
+        sample_hms:            iterable of (h, m) tuples to compute
+
+    Returns:
+        dict mapping (h, m) -> torch.Tensor of shape (d,) in bfloat16.
+    """
+    out = {}
+    for h, m in sample_hms:
+        q = queries_deinterleaved[h, m, :].float()       # (d,)
+        k = keys_for_scores[h, :, :].float()             # (d, S)
+        scores = q @ k                                    # (S,)
+        scaled = scores * scale                           # (S,)
+        if causal:
+            # Match the operator's behaviour: positions strictly greater than m
+            # receive -inf and contribute zero after softmax.
+            scaled = scaled.clone()
+            scaled[m + 1 :] = float("-inf")
+        weights = torch.softmax(scaled, dim=-1)          # (S,)
+        v = values_for_context[h, :, :].float()          # (S, d)
+        out[(h, m)] = (weights @ v).to(torch.bfloat16)   # (d,)
+    return out
+
+
 def _apply_rope_4d(x, angles):
     """Apply RoPE to a 4D tensor using interleaved cos/sin angles.
 
