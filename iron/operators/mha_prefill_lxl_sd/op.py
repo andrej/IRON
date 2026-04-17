@@ -162,12 +162,32 @@ def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True, num_cols=None):
     w_chunk = gemm_M_chunk * S * B          # weights chunk: (M_chunk, S)
     c_chunk = gemm_M_chunk * d * B          # context chunk: (M_chunk, d)
 
+    # ---- Scratch-buffer aliasing via live-range analysis ----
+    # The four logical (H,S,S) attention-matrix scratch buffers (scores,
+    # scaled, masked, weights) have non-overlapping live ranges in the
+    # runlist:
+    #   step 1 (score):    [W: scores]
+    #   step 2 (scale):    [R: scores,  W: scaled]
+    #   step 3 (mask):     [R: scaled,  W: masked]   (causal only)
+    #   step 4 (softmax):  [R: masked/scaled, W: weights]
+    #   step 5 (context):  [R: weights]
+    # Each step's input and output need to be distinct buffers, but
+    # non-adjacent buffers can share storage.  Two physical slots A and B
+    # suffice in either causal or nomask configuration, cutting scratch for
+    # the (H,S,S) matrices from 3-4× to 2× H*S*S*B.
+    if causal_mask:
+        scores_buf, scaled_buf = "attn_A", "attn_B"
+        masked_buf, weights_buf = "attn_A", "attn_B"
+    else:
+        scores_buf, scaled_buf = "attn_A", "attn_B"
+        weights_buf = "attn_A"
+
     score_calls = [
         (
             gemm_scores,
             f"queries[{h*qh + i*q_chunk}:{h*qh + (i+1)*q_chunk}]",
             f"keys[{h*kdS}:{(h+1)*kdS}]",
-            f"attn_scores[{h*sh + i*s_chunk}:{h*sh + (i+1)*s_chunk}]",
+            f"{scores_buf}[{h*sh + i*s_chunk}:{h*sh + (i+1)*s_chunk}]",
         )
         for h in range(H)
         for i in range(n_m_chunks)
@@ -176,7 +196,7 @@ def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True, num_cols=None):
     context_calls = [
         (
             gemm_context,
-            f"attn_weights[{h*sh + i*w_chunk}:{h*sh + (i+1)*w_chunk}]",
+            f"{weights_buf}[{h*sh + i*w_chunk}:{h*sh + (i+1)*w_chunk}]",
             f"values[{h*kSd}:{(h+1)*kSd}]",
             f"attn_context[{h*ch + i*c_chunk}:{h*ch + (i+1)*c_chunk}]",
         )
@@ -185,28 +205,28 @@ def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True, num_cols=None):
     ]
 
     # Build the softmax runlist entries (one per invocation when row-split).
-    softmax_input_buf = "attn_scores_masked" if causal_mask else "attn_scores_scaled"
+    softmax_input_buf = masked_buf if causal_mask else scaled_buf
     softmax_chunk_bytes = softmax_rows_per_inv * S * B
     if n_softmax_invocations == 1:
-        softmax_calls = [(softmax, softmax_input_buf, "attn_weights")]
+        softmax_calls = [(softmax, softmax_input_buf, weights_buf)]
     else:
         softmax_calls = [
             (
                 softmax,
                 f"{softmax_input_buf}[{i*softmax_chunk_bytes}:{(i+1)*softmax_chunk_bytes}]",
-                f"attn_weights[{i*softmax_chunk_bytes}:{(i+1)*softmax_chunk_bytes}]",
+                f"{weights_buf}[{i*softmax_chunk_bytes}:{(i+1)*softmax_chunk_bytes}]",
             )
             for i in range(n_softmax_invocations)
         ]
 
     runlist = [
         *score_calls,
-        (scale, "attn_scores", "attn_scale_factor", "attn_scores_scaled"),
+        (scale, scores_buf, "attn_scale_factor", scaled_buf),
     ]
 
     if causal_mask:
         runlist += [
-            (mask, "attn_scores_scaled", "causal_mask", "attn_scores_masked"),
+            (mask, scaled_buf, "causal_mask", masked_buf),
         ]
 
     runlist += softmax_calls
@@ -216,13 +236,10 @@ def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True, num_cols=None):
         "queries": H * S * d * B,
         "keys": H * d * S * B,
         "values": H * S * d * B,
-        "attn_scores": H * S * S * B,
-        "attn_scores_scaled": H * S * S * B,
-        "attn_weights": H * S * S * B,
+        "attn_A": H * S * S * B,
+        "attn_B": H * S * S * B,
         "attn_context": H * S * d * B,
     }
-    if causal_mask:
-        buffer_sizes["attn_scores_masked"] = H * S * S * B
 
     return runlist, buffer_sizes
 
