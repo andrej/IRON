@@ -12,6 +12,7 @@ from .base import (
     FullElfArtifact,
     XclbinArtifact,
     InstsBinArtifact,
+    OffsetsJsonArtifact,
     KernelObjectArtifact,
     KernelArchiveArtifact,
     PythonGeneratedMLIRArtifact,

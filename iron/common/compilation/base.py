@@ -350,6 +350,18 @@ class InstsBinArtifact(_MLIRInputMixin, CompilationArtifact):
         self.extra_flags = extra_flags if extra_flags is not None else []
 
 
+class OffsetsJsonArtifact(_MLIRInputMixin, CompilationArtifact):
+    def __init__(
+        self,
+        filename: str,
+        mlir_input: CompilationArtifact,
+        dependencies: list[CompilationArtifact],
+    ) -> None:
+        if mlir_input not in dependencies:
+            dependencies = dependencies + [mlir_input]
+        super().__init__(filename, dependencies)
+
+
 class KernelObjectArtifact(CompilationArtifact):
     def __init__(
         self,
@@ -561,6 +573,7 @@ class AieccXclbinInstsCompilationRule(AieccCompilationRule):
                 ]  # TODO: this does not handle the case of multiple xclbins with different kernel names or flags from the same MLIR
                 compile_cmd += first_xclbin.extra_flags + [
                     "--aie-generate-xclbin",
+                    "--aie-generate-pdi",
                     "--xclbin-name=" + os.path.abspath(first_xclbin.filename),
                     "--xclbin-kernel-name=" + first_xclbin.kernel_name,
                 ]
@@ -575,9 +588,16 @@ class AieccXclbinInstsCompilationRule(AieccCompilationRule):
                 ]  # TODO: this does not handle the case of multiple insts.bins with different flags from the same MLIR
                 if not do_compile_xclbin:
                     compile_cmd += ["--no-compile"]
+                insts_bin_path = os.path.abspath(first_insts_bin.filename)
+                insts_bin_dir = os.path.dirname(insts_bin_path)
+                insts_bin_stem = Path(first_insts_bin.filename).stem
+                offsets_json_path = os.path.join(
+                    insts_bin_dir, insts_bin_stem + "_offsets.json"
+                )
                 compile_cmd += first_insts_bin.extra_flags + [
                     "--aie-generate-npu-insts",
-                    "--npu-insts-name=" + os.path.abspath(first_insts_bin.filename),
+                    "--npu-insts-name=" + insts_bin_path,
+                    "--npu-insts-offsets-name=" + offsets_json_path,
                 ]
             compile_cmd += [os.path.abspath(mlir_source.filename)]
 
