@@ -176,7 +176,8 @@ def my_matvec(
             tg_ac = rt.task_group()
             for col in range(cols):
                 rt.fill(
-                    A_L3L1_fifos[col].prod(), A, A_taps[col][batch], task_group=tg_ac
+                    A_L3L1_fifos[col].prod(), A, A_taps[col][batch], task_group=tg_ac,
+                    wait=True,
                 )
             for col in range(cols):
                 rt.drain(
