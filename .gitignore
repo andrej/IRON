@@ -33,3 +33,6 @@ build_elf/
 # Auto-detected build artifacts
 build_elf_1layers/
 build_elf_2layers/
+
+# Auto-detected build artifacts
+build_elf_16layers/
