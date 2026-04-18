@@ -458,6 +458,12 @@ class FusedXclbinCallable:
                 self._patched_insts, filtered_infos, str(pdi_file)
             )
 
+        # Create the instruction buffer object and fix up LOAD_PDI addresses
+        # from relative byte offsets to absolute device addresses.
+        # The C++ test_utils does this after creating the bo; the Python
+        # xclbin_patching.patch_load_pdi only sets relative offsets.
+        self._fixup_load_pdi_addresses()
+
         # Allocate shared input/output/scratch buffers
         input_buffer_size, output_buffer_size, scratch_buffer_size = op.buffer_sizes
         itemsize = np.dtype(ml_dtypes.bfloat16).itemsize
@@ -507,6 +513,51 @@ class FusedXclbinCallable:
         self._buffer_cache[buffer_name] = sub_buffer
         return sub_buffer
 
+    def _fixup_load_pdi_addresses(self):
+        """Create an XRT buffer object for instructions and convert LOAD_PDI
+        address fields from relative byte offsets to absolute device addresses.
+
+        This mirrors what the C++ test_utils code does:
+          1. Create a bo from the instruction data
+          2. Get the bo's device address
+          3. For each LOAD_PDI entry, convert address = bo_addr + relative_offset
+          4. Write the fixed-up data back into the bo
+        """
+        import pyxrt as _pyxrt
+
+        group_id = self._kernel_handle.kernel.group_id(1)
+        self._insts_tensor = XRTTensor(
+            self._patched_insts,
+            flags=_pyxrt.bo.cacheable,
+            group_id=group_id,
+        )
+        bo = self._insts_tensor.buffer_object()
+        bo_addr = bo.address()
+
+        # The _insts_tensor._data is the memory-mapped numpy view of the bo.
+        # We work on this view so changes go directly into the bo.
+        self._insts_bo_data = self._insts_tensor.data
+
+        # Fix up each LOAD_PDI address field from relative to absolute
+        # in both the bo data and _patched_insts (the baseline copy)
+        for info in self._load_pdi_infos:
+            addr_idx = info.address_field_offset_bytes // 4
+            rel_offset = int(self._insts_bo_data[addr_idx])
+            abs_addr = bo_addr + rel_offset
+            lo = np.uint32(abs_addr & 0xFFFFFFFF)
+            hi = np.uint32(abs_addr >> 32)
+            self._insts_bo_data[addr_idx] = lo
+            self._insts_bo_data[addr_idx + 1] = hi
+            self._patched_insts[addr_idx] = lo
+            self._patched_insts[addr_idx + 1] = hi
+
+        # Sync the fixed-up instructions to the device
+        self._insts_tensor.to("npu")
+
+        # Store the bo on the kernel handle so the runtime reuses it
+        self._kernel_handle.insts = self._patched_insts
+        self._kernel_handle.insts_bo = bo
+
     def patch_rtp(self, name, value):
         """Patch a named RTP parameter in the instruction stream."""
         patch_rtp(self._patched_insts, self._write32_infos, name, value)
@@ -518,12 +569,16 @@ class FusedXclbinCallable:
     def reload_insts(self):
         """Reload the patched instruction stream into the kernel handle.
 
-        Call this after patching RTPs or magic values to update the
-        instructions that will be sent to the NPU on the next run.
+        Copies the patched instruction data into the memory-mapped bo
+        and syncs to device. The LOAD_PDI address fields are already
+        absolute (set during __init__), and the per-token patches only
+        touch non-address fields (StridedCopy offsets, softmax mask
+        width), so no re-fixup is needed.
         """
-        self._kernel_handle.insts = self._patched_insts
-        # Invalidate cached insts_bo so it gets recreated with new data
-        self._kernel_handle.insts_bo = None
+        # Copy patched instruction words into the bo's mapped memory
+        np.copyto(self._insts_bo_data, self._patched_insts)
+        # Sync to device
+        self._insts_tensor.to("npu")
 
     def __call__(self):
         self.input_buffer.to("npu")

@@ -277,7 +277,7 @@ class AIELlamaOperators:
         # Decode operator (everything temporally fused)
         # ##################################################################
 
-        elf_ctx = AIEContext(build_dir="build_elf")
+        elf_ctx = AIEContext(build_dir=f"build_elf_{config.n_layers}layers")
 
         gemv_attn_query_op = GEMV(
             M=config.n_heads * config.head_dim,
@@ -1332,6 +1332,11 @@ def main():
     prompt = harness.get_prompt(args.prompt_len)
 
     config, state = harness.init(args.weights_path, args.tokenizer_path, prompt=prompt)
+
+    if args.n_layers is not None:
+        assert 1 <= args.n_layers <= 16, "n_layers must be between 1 and 16"
+        print(f"*** OVERRIDING n_layers: {config.n_layers} -> {args.n_layers} ***")
+        config.n_layers = args.n_layers
 
     aie_ops = AIELlamaOperators(config, max_seq_len)
     aie_buffers = AIELlamaBuffers(config, max_seq_len, aie_ops)

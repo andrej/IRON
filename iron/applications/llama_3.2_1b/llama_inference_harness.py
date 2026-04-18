@@ -189,6 +189,12 @@ def parse_args():
         default=40,
         help="Number of tokens to generate (default: 40)",
     )
+    parser.add_argument(
+        "--n-layers",
+        type=int,
+        default=None,
+        help="Override number of transformer layers (default: use model config, 16 for llama3.2-1b)",
+    )
     return parser.parse_args()
 
 
