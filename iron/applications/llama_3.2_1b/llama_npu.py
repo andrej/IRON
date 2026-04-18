@@ -27,9 +27,6 @@ from iron.common.context import AIEContext
 from iron.common.utils import XRTSubBuffer
 from iron.common.fusion import (
     FusedMLIROperator,
-    FusedFullELFCallable,
-    load_elf,
-    patch_elf,
 )
 from iron.operators import (
     RMSNorm,
@@ -587,13 +584,21 @@ class AIELlamaOperators:
             context=elf_ctx,
         ).compile()
 
-        # Operator patching
+        # Use xclbin flow: get_callable() returns FusedXclbinCallable
+        self.decode.fused = self.decode.fused_op.get_callable()
 
-        self.decode.fused_elf_data = load_elf(self.decode.fused_op)
+        # Save the PDI-patched instruction stream as the reset baseline for per-token patching
+        self.decode.fused_insts_baseline = self.decode.fused._patched_insts.copy()
 
-        def get_patch_locs(elf_data, magic):
+        # Precompute StridedCopy patch locations in the xclbin instruction stream.
+        # The instruction stream contains magic-combined values:
+        #   buffer_base_offset + strided_copy_cache_magic * 2
+        # We scan for these to build a map of {word_index: buffer_base_offset}.
+        insts = self.decode.fused._patched_insts
+
+        def get_patch_locs(data, magic):
             magic = magic & 0xFFFFFFFF
-            return np.where(elf_data == magic)[0]
+            return np.where(data == magic)[0]
 
         keys_patches = {}
         values_patches = {}
@@ -608,7 +613,7 @@ class AIELlamaOperators:
                 {
                     int(l): keys_cache_offs
                     for l in get_patch_locs(
-                        self.decode.fused_elf_data,
+                        insts,
                         (keys_cache_offs + strided_copy_cache_magic * 2),
                     )
                 }
@@ -617,7 +622,7 @@ class AIELlamaOperators:
                 {
                     int(l): values_cache_offs
                     for l in get_patch_locs(
-                        self.decode.fused_elf_data,
+                        insts,
                         (values_cache_offs + strided_copy_cache_magic * 2),
                     )
                 }
@@ -625,7 +630,7 @@ class AIELlamaOperators:
         no_offset_patches = {
             int(l): 0
             for l in get_patch_locs(
-                self.decode.fused_elf_data, (strided_copy_cache_magic * 2)
+                insts, (strided_copy_cache_magic * 2)
             )
         }
         self.decode.fused_patch_locations = {
@@ -636,13 +641,9 @@ class AIELlamaOperators:
         assert len(self.decode.fused_patch_locations) == 4 * config.n_layers + 2
 
         self.decode.softmax_patch_offsets = get_patch_locs(
-            self.decode.fused_elf_data, softmax_magic
+            insts, softmax_magic
         )
         assert len(self.decode.softmax_patch_offsets) == config.n_layers + 1
-
-        self.decode.fused = FusedFullELFCallable(
-            self.decode.fused_op, elf_data=self.decode.fused_elf_data
-        )
 
         # Operator static buffers (weights, LUTs)
 
@@ -1224,20 +1225,22 @@ def llama_forward_pass_prefill(config, state):
 
 def patch_fused_decode_operator(ops, config, num_preceding_tokens):
     context_len = num_preceding_tokens + 1
+    callable = ops.fused
 
-    # Patch fused operator for strided copy cache offset
+    # Reset instruction stream to PDI-patched baseline before applying per-token patches
+    callable._patched_insts[:] = ops.fused_insts_baseline
+
+    # Patch StridedCopy cache offsets (DMA address offsets, not RTPs)
     output_offset = num_preceding_tokens * config.head_dim
     offset_val = output_offset * 2  # Multiply by 2 for bfloat16 byte offset
-    strided_copy_patches = {
-        i: (base + offset_val, 0xFFFFFFFF)
-        for i, base in ops.fused_patch_locations.items()
-    }
-    softmax_patches = {i: (context_len, 0xFFFFFFFF) for i in ops.softmax_patch_offsets}
-    patches = {**strided_copy_patches, **softmax_patches}
-    patched_elf_data = ops.fused_elf_data.copy()
-    patch_elf(patched_elf_data, patches)
+    for i, base in ops.fused_patch_locations.items():
+        callable._patched_insts[i] = np.uint32(base + offset_val)
 
-    ops.fused.reload_elf(patched_elf_data)
+    # Patch Softmax mask width (context length)
+    for i in ops.softmax_patch_offsets:
+        callable._patched_insts[i] = np.uint32(context_len)
+
+    callable.reload_insts()
 
 
 def llama_forward_pass_decode(config, state):
@@ -1263,8 +1266,7 @@ def llama_forward_pass_decode(config, state):
     ] = x
 
     # Fused NPU operator for all of decode (16 transformer blocks + final norm + final linear layer)
-    aie_ops.decode.fused.input_buffer.to("cpu")
-    aie_ops.decode.fused()  # FusedFullELFCallable.__call__() syncs output_buffer to cpu
+    aie_ops.decode.fused()  # FusedXclbinCallable.__call__() syncs input to NPU and output to CPU
     logits = (
         aie_ops.decode.fused.get_buffer("logits")
         .to_torch()
