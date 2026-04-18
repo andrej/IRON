@@ -32,7 +32,7 @@ from . import (
 # ##########################################################################
 
 
-class FusedMLIRSource(CompilationArtifact):
+class FusedMLIRSource(SourceArtifact):
     def __init__(
         self,
         filename: str,
