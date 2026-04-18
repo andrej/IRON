@@ -439,11 +439,17 @@ class FusedXclbinCallable:
         handle = aie_utils.DefaultNPURuntime.load(npu_kernel)
         self._kernel_handle = handle
 
-        # Prepare patched instructions (patch PDI once)
+        # Prepare patched instructions (patch PDI once per PDI file).
+        # The compiler assigns 1-based pdi_ids sequentially by device order,
+        # matching the sorted PDI file order (op0_*.pdi → pdi_id=1, etc.).
         self._patched_insts = self._base_insts.copy()
-        for pdi_file in self.pdi_files:
+        for idx, pdi_file in enumerate(self.pdi_files):
+            pdi_id = idx + 1  # compiler uses 1-based IDs
+            filtered_infos = [
+                info for info in self._load_pdi_infos if info.pdi_id == pdi_id
+            ]
             self._patched_insts = patch_load_pdi(
-                self._patched_insts, self._load_pdi_infos, str(pdi_file)
+                self._patched_insts, filtered_infos, str(pdi_file)
             )
 
         # Allocate shared input/output/scratch buffers
