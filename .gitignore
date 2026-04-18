@@ -26,3 +26,6 @@ id_ed25519.pub
 *.o
 *.xclbin
 iron/
+
+# Auto-detected build artifacts
+build_elf/
