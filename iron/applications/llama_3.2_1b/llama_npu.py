@@ -8,7 +8,6 @@
 # [ ] Opportunity to fuse data layout transformations (e.g., transpose ops) onto end of other operations (e.g., transpose after RoPE)
 # [ ] Some kernels are not optimized; e.g., softmax masking is using scalar cores
 # [ ] Fine-tune parameters of operators (e.g., num AIE columns, tile sizes)
-# [ ] Patching of operators (instantiating new xrt::elf for each token) is slow; find quicker way of patching instruction sequence in-memory
 # [ ] Spatial fusion of operators
 
 import torch
@@ -19,6 +18,8 @@ import numpy as np
 import ml_dtypes
 import llama_inference_harness as harness
 import logging
+
+logger = logging.getLogger(__name__)
 
 repo_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(repo_root))
@@ -638,18 +639,14 @@ class AIELlamaOperators:
             **values_patches,
             **no_offset_patches,
         }
-        # The expected count differs between ELF and xclbin instruction flows:
-        # ELF flow: 4*n_layers + 2 = 66 (2 per cache per layer + 2 with no offset)
-        # Xclbin flow: n_layers + n_layers + 2*n_layers = 4*n_layers = 64
-        # (1 per keys_cache per layer + 1 per values_cache per layer + 2 per layer with no offset)
-        # Both are valid; the important thing is we find all DMA offset locations.
         actual_patch_locs = len(self.decode.fused_patch_locations)
         min_expected = 2 * config.n_layers  # At minimum: 1 keys + 1 values per layer
         assert actual_patch_locs >= min_expected, (
             f"StridedCopy patch locations too few: got {actual_patch_locs}, need at least {min_expected}"
         )
-        print(f"StridedCopy patch locations found: {actual_patch_locs} "
-              f"(keys={len(keys_patches)}, values={len(values_patches)}, no_offset={len(no_offset_patches)})")
+        logger.info("StridedCopy patch locations found: %d "
+                     "(keys=%d, values=%d, no_offset=%d)",
+                     actual_patch_locs, len(keys_patches), len(values_patches), len(no_offset_patches))
 
         self.decode.softmax_patch_offsets = get_patch_locs(
             insts, softmax_magic
@@ -657,11 +654,12 @@ class AIELlamaOperators:
         actual_softmax = len(self.decode.softmax_patch_offsets)
         expected_softmax = config.n_layers + 1
         if actual_softmax != expected_softmax:
-            print(f"WARNING: Softmax patch locations: expected {expected_softmax}, got {actual_softmax}")
+            logger.warning("Softmax patch locations: expected %d, got %d",
+                           expected_softmax, actual_softmax)
         assert actual_softmax >= config.n_layers, (
             f"Softmax patch locations too few: got {actual_softmax}, need at least {config.n_layers}"
         )
-        print(f"Softmax patch locations found: {actual_softmax}")
+        logger.info("Softmax patch locations found: %d", actual_softmax)
 
         # Operator static buffers (weights, LUTs)
 
@@ -1322,7 +1320,7 @@ def llama_forward_pass(config, state):
 
 def main():
     global aie_ops, aie_buffers, max_seq_len
-    logging.basicConfig(level=logging.DEBUG)
+    logging.basicConfig(level=logging.INFO)
     args = harness.parse_args()
 
     assert (
@@ -1335,7 +1333,7 @@ def main():
 
     if args.n_layers is not None:
         assert 1 <= args.n_layers <= 16, "n_layers must be between 1 and 16"
-        print(f"*** OVERRIDING n_layers: {config.n_layers} -> {args.n_layers} ***")
+        logger.warning("OVERRIDING n_layers: %d -> %d", config.n_layers, args.n_layers)
         config.n_layers = args.n_layers
 
     aie_ops = AIELlamaOperators(config, max_seq_len)

@@ -175,6 +175,9 @@ def my_matvec(
         for batch in range(num_batches):
             tg_ac = rt.task_group()
             for col in range(cols):
+                # wait=True ensures the MM2S channel completes the previous
+                # batch transfer before being reconfigured for the next batch,
+                # preventing a DMA race condition.
                 rt.fill(
                     A_L3L1_fifos[col].prod(), A, A_taps[col][batch], task_group=tg_ac,
                     wait=True,

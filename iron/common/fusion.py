@@ -3,8 +3,6 @@
 
 import numpy as np
 import ml_dtypes
-import pyxrt
-import ctypes
 from pathlib import Path
 from . import compilation as comp
 from .base import AIEOperatorBase, MLIROperator
@@ -273,129 +271,6 @@ class FusedMLIROperator(AIEOperatorBase):
 
         buf_type, offset, length = self.subbuffer_layout[buffer_name]
         return buf_type, offset, length
-
-
-def load_elf(op):
-    assert isinstance(op.artifacts[0], comp.FullElfArtifact)
-    elf_data = None
-    with open(op.artifacts[0].filename, "rb") as f:
-        elf_data = np.frombuffer(f.read(), dtype=np.uint32)
-    return elf_data
-
-
-def patch_elf(elf_data, patches):
-    for i, patch in patches.items():
-        val, mask = patch
-        val = np.uint64(val)
-        mask = np.uint64(mask)  # avoid numpy overflow errors
-        elf_data[i] = np.uint32((elf_data[i] & ~mask) | (val & mask))
-    return elf_data
-
-
-class FullELFCallable:
-    def __init__(
-        self,
-        elf_data,
-        device_name="main",
-        sequence_name="sequence",
-    ):
-        self.device_name = device_name
-        self.sequence_name = sequence_name
-        self.reload_elf(elf_data)
-
-    def __call__(self, *args):
-        run = pyxrt.run(self.xrt_kernel)
-        for i, arg in enumerate(args):
-            assert isinstance(arg, pyxrt.bo), f"Argument {i} is not a pyxrt.bo"
-            run.set_arg(i, arg)
-        run.start()
-        ret_code = run.wait()
-        if ret_code != pyxrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED:
-            raise RuntimeError(f"Kernel execution failed with return code {ret_code}")
-
-    def reload_elf(self, elf_data):
-        # Create a PyCapsule from the numpy array pointer for pybind11
-        elf_data_u8 = elf_data.view(dtype=np.uint8)
-        ctypes.pythonapi.PyCapsule_New.restype = ctypes.py_object
-        ctypes.pythonapi.PyCapsule_New.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_char_p,
-            ctypes.c_void_p,
-        ]
-        capsule = ctypes.pythonapi.PyCapsule_New(elf_data_u8.ctypes.data, None, None)
-        xrt_elf = pyxrt.elf(capsule, elf_data.nbytes)
-        xrt_context = pyxrt.hw_context(aie_utils.DefaultNPURuntime._device, xrt_elf)
-        self.xrt_kernel = pyxrt.ext.kernel(
-            xrt_context, f"{self.device_name}:{self.sequence_name}"
-        )
-
-
-class FusedFullELFCallable(FullELFCallable):
-    def __init__(self, op, elf_data=None):
-        if elf_data is None:
-            elf_data = load_elf(op)
-        super().__init__(elf_data)
-
-        self.op = op
-        input_buffer_size, output_buffer_size, scratch_buffer_size = op.buffer_sizes
-        itemsize = np.dtype(ml_dtypes.bfloat16).itemsize
-
-        self.input_buffer = XRTTensor(
-            (max(input_buffer_size, itemsize) // itemsize,),
-            dtype=ml_dtypes.bfloat16,
-        )
-
-        self.output_buffer = XRTTensor(
-            (max(output_buffer_size, itemsize) // itemsize,),
-            dtype=ml_dtypes.bfloat16,
-        )
-
-        self.scratch_buffer = XRTTensor(
-            (max(scratch_buffer_size, itemsize) // itemsize,),
-            dtype=ml_dtypes.bfloat16,
-        )
-
-        self._buffer_cache = {}
-
-    def get_buffer(self, buffer_name):
-        # Return cached buffer if already allocated
-        if buffer_name in self._buffer_cache:
-            return self._buffer_cache[buffer_name]
-
-        buf_type, offset, length = self.op.get_layout_for_buffer(buffer_name)
-
-        # Select the appropriate main buffer
-        if buf_type == "input":
-            main_buffer = self.input_buffer
-        elif buf_type == "output":
-            main_buffer = self.output_buffer
-        elif buf_type == "scratch":
-            main_buffer = self.scratch_buffer
-        else:
-            raise ValueError(
-                f"Unknown buffer type '{buf_type}' for buffer '{buffer_name}'"
-            )
-
-        itemsize = np.dtype(ml_dtypes.bfloat16).itemsize
-        sub_buffer = XRTSubBuffer(
-            parent_bo=main_buffer.buffer_object(),
-            offset_bytes=offset,
-            size_bytes=length,
-            shape=(length // itemsize,),
-            dtype=ml_dtypes.bfloat16,
-        )
-
-        self._buffer_cache[buffer_name] = sub_buffer
-        return sub_buffer
-
-    def __call__(self):
-        self.input_buffer.to("npu")
-        super().__call__(
-            self.input_buffer.buffer_object(),
-            self.output_buffer.buffer_object(),
-            self.scratch_buffer.buffer_object(),
-        )
-        self.output_buffer.to("cpu")
 
 
 class FusedXclbinCallable:
