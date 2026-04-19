@@ -1407,7 +1407,8 @@ def main():
         logger.warning("OVERRIDING n_layers: %d -> %d", config.n_layers, args.n_layers)
         config.n_layers = args.n_layers
 
-    aie_ops = AIELlamaOperators(config, max_seq_len, use_elf=args.use_elf)
+    use_elf = not args.use_xclbin  # ELF is default; --use-xclbin overrides
+    aie_ops = AIELlamaOperators(config, max_seq_len, use_elf=use_elf)
     aie_buffers = AIELlamaBuffers(config, max_seq_len, aie_ops)
 
     print(prompt, end="", flush=True)

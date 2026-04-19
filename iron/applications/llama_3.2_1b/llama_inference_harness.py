@@ -198,8 +198,15 @@ def parse_args():
     parser.add_argument(
         "--use-elf",
         action="store_true",
+        default=True,
+        help="Use the full-ELF flow for the decode fused operator (default: True)",
+    )
+    parser.add_argument(
+        "--use-xclbin",
+        action="store_true",
         default=False,
-        help="Use the full-ELF flow instead of xclbin for the decode fused operator",
+        help="Use the xclbin flow instead of ELF for the decode fused operator "
+             "(works for small models but hits firmware instruction bo size limit at ~16 layers)",
     )
     return parser.parse_args()
 
