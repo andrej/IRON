@@ -195,6 +195,12 @@ def parse_args():
         default=None,
         help="Override number of transformer layers (default: use model config, 16 for llama3.2-1b)",
     )
+    parser.add_argument(
+        "--use-elf",
+        action="store_true",
+        default=False,
+        help="Use the full-ELF flow instead of xclbin for the decode fused operator",
+    )
     return parser.parse_args()
 
 

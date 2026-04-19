@@ -28,6 +28,9 @@ from iron.common.context import AIEContext
 from iron.common.utils import XRTSubBuffer
 from iron.common.fusion import (
     FusedMLIROperator,
+    FusedFullELFCallable,
+    load_elf,
+    patch_elf,
 )
 from iron.operators import (
     RMSNorm,
@@ -64,7 +67,8 @@ class AIEDecodeOperations:
 
 class AIELlamaOperators:
 
-    def __init__(self, config, prompt_len):
+    def __init__(self, config, prompt_len, use_elf=False):
+        self.use_elf = use_elf
         self.context = AIEContext()
         self.context.build_dir.mkdir(parents=True, exist_ok=True)
 
@@ -560,9 +564,9 @@ class AIELlamaOperators:
             (gemv_out_head_op, "W_out_head", "x", "logits"),
         ]
 
-        self.decode.fused_op = FusedMLIROperator(
-            "fused_op",
-            runlist,
+        fused_op_kwargs = dict(
+            name="fused_op",
+            runlist=runlist,
             input_args=[  # arguments that change between invocations of the fused kernel and therefore need to be synced on each token
                 "x",
                 "rope_angles",
@@ -583,83 +587,140 @@ class AIELlamaOperators:
                 },
             },
             context=elf_ctx,
-        ).compile()
+        )
 
-        # Use xclbin flow: get_callable() returns FusedXclbinCallable
-        self.decode.fused = self.decode.fused_op.get_callable()
+        fused_mlir_op = FusedMLIROperator(**fused_op_kwargs)
 
-        # Save the PDI-patched instruction stream as the reset baseline for per-token patching
-        self.decode.fused_insts_baseline = self.decode.fused._patched_insts.copy()
-
-        # Precompute StridedCopy patch locations in the xclbin instruction stream.
-        # The instruction stream contains magic-combined values:
-        #   buffer_base_offset + strided_copy_cache_magic * 2
-        # We scan for these to build a map of {word_index: buffer_base_offset}.
-        insts = self.decode.fused._patched_insts
+        if use_elf:
+            self.decode.fused_op = fused_mlir_op.compile_elf()
+        else:
+            self.decode.fused_op = fused_mlir_op.compile()
 
         def get_patch_locs(data, magic):
             magic = magic & 0xFFFFFFFF
             return np.where(data == magic)[0]
 
-        keys_patches = {}
-        values_patches = {}
-        for layer_idx in range(config.n_layers):
-            _, keys_cache_offs, _ = self.decode.fused_op.get_layout_for_buffer(
-                f"keys_cache_{layer_idx}"
-            )
-            _, values_cache_offs, _ = self.decode.fused_op.get_layout_for_buffer(
-                f"values_cache_{layer_idx}"
-            )
-            keys_patches.update(
-                {
-                    int(l): keys_cache_offs
-                    for l in get_patch_locs(
-                        insts,
-                        (keys_cache_offs + strided_copy_cache_magic * 2),
-                    )
-                }
-            )
-            values_patches.update(
-                {
-                    int(l): values_cache_offs
-                    for l in get_patch_locs(
-                        insts,
-                        (values_cache_offs + strided_copy_cache_magic * 2),
-                    )
-                }
-            )
-        no_offset_patches = {
-            int(l): 0
-            for l in get_patch_locs(
-                insts, (strided_copy_cache_magic * 2)
-            )
-        }
-        self.decode.fused_patch_locations = {
-            **keys_patches,
-            **values_patches,
-            **no_offset_patches,
-        }
-        actual_patch_locs = len(self.decode.fused_patch_locations)
-        min_expected = 2 * config.n_layers  # At minimum: 1 keys + 1 values per layer
-        assert actual_patch_locs >= min_expected, (
-            f"StridedCopy patch locations too few: got {actual_patch_locs}, need at least {min_expected}"
-        )
-        logger.info("StridedCopy patch locations found: %d "
-                     "(keys=%d, values=%d, no_offset=%d)",
-                     actual_patch_locs, len(keys_patches), len(values_patches), len(no_offset_patches))
+        if use_elf:
+            # ELF flow: load ELF data, scan for patch locations, create callable
+            self.decode.fused_elf_data = load_elf(self.decode.fused_op)
 
-        self.decode.softmax_patch_offsets = get_patch_locs(
-            insts, softmax_magic
-        )
-        actual_softmax = len(self.decode.softmax_patch_offsets)
-        expected_softmax = config.n_layers + 1
-        if actual_softmax != expected_softmax:
-            logger.warning("Softmax patch locations: expected %d, got %d",
-                           expected_softmax, actual_softmax)
-        assert actual_softmax >= config.n_layers, (
-            f"Softmax patch locations too few: got {actual_softmax}, need at least {config.n_layers}"
-        )
-        logger.info("Softmax patch locations found: %d", actual_softmax)
+            keys_patches = {}
+            values_patches = {}
+            for layer_idx in range(config.n_layers):
+                _, keys_cache_offs, _ = self.decode.fused_op.get_layout_for_buffer(
+                    f"keys_cache_{layer_idx}"
+                )
+                _, values_cache_offs, _ = self.decode.fused_op.get_layout_for_buffer(
+                    f"values_cache_{layer_idx}"
+                )
+                keys_patches.update(
+                    {
+                        int(l): keys_cache_offs
+                        for l in get_patch_locs(
+                            self.decode.fused_elf_data,
+                            (keys_cache_offs + strided_copy_cache_magic * 2),
+                        )
+                    }
+                )
+                values_patches.update(
+                    {
+                        int(l): values_cache_offs
+                        for l in get_patch_locs(
+                            self.decode.fused_elf_data,
+                            (values_cache_offs + strided_copy_cache_magic * 2),
+                        )
+                    }
+                )
+            no_offset_patches = {
+                int(l): 0
+                for l in get_patch_locs(
+                    self.decode.fused_elf_data, (strided_copy_cache_magic * 2)
+                )
+            }
+            self.decode.fused_patch_locations = {
+                **keys_patches,
+                **values_patches,
+                **no_offset_patches,
+            }
+            assert len(self.decode.fused_patch_locations) == 4 * config.n_layers + 2
+
+            self.decode.softmax_patch_offsets = get_patch_locs(
+                self.decode.fused_elf_data, softmax_magic
+            )
+            assert len(self.decode.softmax_patch_offsets) == config.n_layers + 1
+
+            self.decode.fused = FusedFullELFCallable(
+                self.decode.fused_op, elf_data=self.decode.fused_elf_data
+            )
+        else:
+            # Xclbin flow: get_callable() returns FusedXclbinCallable
+            self.decode.fused = self.decode.fused_op.get_callable()
+
+            # Save the PDI-patched instruction stream as the reset baseline for per-token patching
+            self.decode.fused_insts_baseline = self.decode.fused._patched_insts.copy()
+
+            # Precompute StridedCopy patch locations in the xclbin instruction stream.
+            insts = self.decode.fused._patched_insts
+
+            keys_patches = {}
+            values_patches = {}
+            for layer_idx in range(config.n_layers):
+                _, keys_cache_offs, _ = self.decode.fused_op.get_layout_for_buffer(
+                    f"keys_cache_{layer_idx}"
+                )
+                _, values_cache_offs, _ = self.decode.fused_op.get_layout_for_buffer(
+                    f"values_cache_{layer_idx}"
+                )
+                keys_patches.update(
+                    {
+                        int(l): keys_cache_offs
+                        for l in get_patch_locs(
+                            insts,
+                            (keys_cache_offs + strided_copy_cache_magic * 2),
+                        )
+                    }
+                )
+                values_patches.update(
+                    {
+                        int(l): values_cache_offs
+                        for l in get_patch_locs(
+                            insts,
+                            (values_cache_offs + strided_copy_cache_magic * 2),
+                        )
+                    }
+                )
+            no_offset_patches = {
+                int(l): 0
+                for l in get_patch_locs(
+                    insts, (strided_copy_cache_magic * 2)
+                )
+            }
+            self.decode.fused_patch_locations = {
+                **keys_patches,
+                **values_patches,
+                **no_offset_patches,
+            }
+            actual_patch_locs = len(self.decode.fused_patch_locations)
+            min_expected = 2 * config.n_layers
+            assert actual_patch_locs >= min_expected, (
+                f"StridedCopy patch locations too few: got {actual_patch_locs}, need at least {min_expected}"
+            )
+            logger.info("StridedCopy patch locations found: %d "
+                         "(keys=%d, values=%d, no_offset=%d)",
+                         actual_patch_locs, len(keys_patches), len(values_patches), len(no_offset_patches))
+
+            self.decode.softmax_patch_offsets = get_patch_locs(
+                insts, softmax_magic
+            )
+            actual_softmax = len(self.decode.softmax_patch_offsets)
+            expected_softmax = config.n_layers + 1
+            if actual_softmax != expected_softmax:
+                logger.warning("Softmax patch locations: expected %d, got %d",
+                               expected_softmax, actual_softmax)
+            assert actual_softmax >= config.n_layers, (
+                f"Softmax patch locations too few: got {actual_softmax}, need at least {config.n_layers}"
+            )
+            logger.info("Softmax patch locations found: %d", actual_softmax)
 
         # Operator static buffers (weights, LUTs)
 
@@ -1239,24 +1300,31 @@ def llama_forward_pass_prefill(config, state):
 # ##########################################################################
 
 
-def patch_fused_decode_operator(ops, config, num_preceding_tokens):
+def patch_fused_decode_operator(ops, config, num_preceding_tokens, use_elf=False):
     context_len = num_preceding_tokens + 1
-    callable = ops.fused
-
-    # Reset instruction stream to PDI-patched baseline before applying per-token patches
-    callable._patched_insts[:] = ops.fused_insts_baseline
-
-    # Patch StridedCopy cache offsets (DMA address offsets, not RTPs)
     output_offset = num_preceding_tokens * config.head_dim
     offset_val = output_offset * 2  # Multiply by 2 for bfloat16 byte offset
-    for i, base in ops.fused_patch_locations.items():
-        callable._patched_insts[i] = np.uint32(base + offset_val)
 
-    # Patch Softmax mask width (context length)
-    for i in ops.softmax_patch_offsets:
-        callable._patched_insts[i] = np.uint32(context_len)
-
-    callable.reload_insts()
+    if use_elf:
+        # ELF flow: patch ELF data and reload
+        strided_copy_patches = {
+            i: (base + offset_val, 0xFFFFFFFF)
+            for i, base in ops.fused_patch_locations.items()
+        }
+        softmax_patches = {i: (context_len, 0xFFFFFFFF) for i in ops.softmax_patch_offsets}
+        patches = {**strided_copy_patches, **softmax_patches}
+        patched_elf_data = ops.fused_elf_data.copy()
+        patch_elf(patched_elf_data, patches)
+        ops.fused.reload_elf(patched_elf_data)
+    else:
+        # Xclbin flow: patch instruction stream and reload
+        callable = ops.fused
+        callable._patched_insts[:] = ops.fused_insts_baseline
+        for i, base in ops.fused_patch_locations.items():
+            callable._patched_insts[i] = np.uint32(base + offset_val)
+        for i in ops.softmax_patch_offsets:
+            callable._patched_insts[i] = np.uint32(context_len)
+        callable.reload_insts()
 
 
 def llama_forward_pass_decode(config, state):
@@ -1264,7 +1332,8 @@ def llama_forward_pass_decode(config, state):
     assert seq_len == 1
     assert state.num_preceding_tokens < max_seq_len
 
-    patch_fused_decode_operator(aie_ops.decode, config, state.num_preceding_tokens)
+    patch_fused_decode_operator(aie_ops.decode, config, state.num_preceding_tokens,
+                                use_elf=aie_ops.use_elf)
 
     # Prefill RoPE angle look-up tables
     angles_slice = config.angles[
@@ -1282,7 +1351,9 @@ def llama_forward_pass_decode(config, state):
     ] = x
 
     # Fused NPU operator for all of decode (16 transformer blocks + final norm + final linear layer)
-    aie_ops.decode.fused()  # FusedXclbinCallable.__call__() syncs input to NPU and output to CPU
+    if aie_ops.use_elf:
+        aie_ops.decode.fused.input_buffer.to("cpu")
+    aie_ops.decode.fused()
     logits = (
         aie_ops.decode.fused.get_buffer("logits")
         .to_torch()
@@ -1336,7 +1407,7 @@ def main():
         logger.warning("OVERRIDING n_layers: %d -> %d", config.n_layers, args.n_layers)
         config.n_layers = args.n_layers
 
-    aie_ops = AIELlamaOperators(config, max_seq_len)
+    aie_ops = AIELlamaOperators(config, max_seq_len, use_elf=args.use_elf)
     aie_buffers = AIELlamaBuffers(config, max_seq_len, aie_ops)
 
     print(prompt, end="", flush=True)
