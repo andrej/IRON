@@ -519,6 +519,7 @@ class AieccFullElfCompilationRule(AieccCompilationRule):
                 "--no-xbridge",
                 "--peano",
                 str(self.peano_dir),
+                "--dynamic-objFifos",
                 "--expand-load-pdis",
                 "--generate-full-elf",
                 "--full-elf-name",
