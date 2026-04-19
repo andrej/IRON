@@ -36,3 +36,9 @@ build_elf_2layers/
 
 # Auto-detected build artifacts
 build_elf_16layers/
+
+# Auto-detected build artifacts
+build_elf_4layers/
+build_elf_5layers/
+build_elf_6layers/
+build_elf_8layers/
