@@ -217,34 +217,34 @@ def test_mha_prefill_benchmark(H, G, d, E, S, causal, dispatch):
     print(f"\nLatency (us): {latency_us:.1f}")
     print(f"Throughput: {gflops:.6e} GFLOP/s")
 
-    # # ---- Sample-based correctness check ----
-    # # Pick a handful of random (head, row) pairs and recompute the expected
-    # # attn_context row for each (cheap: O(S*d) per sample).
-    # actual_context = _get_output_tensor(fc, "attn_context", (H, S, d))
-    # rng = np.random.default_rng(seed=0)
-    # n_samples = min(8, H)
-    # sample_hms = [(int(rng.integers(0, H)), int(rng.integers(0, S))) for _ in range(n_samples)]
-    # expected_rows = compute_attn_context_at_rows(
-    #     inputs["queries_deinterleaved"],
-    #     inputs["keys_for_scores"],
-    #     inputs["values_for_context"],
-    #     inputs["_scale"],
-    #     causal,
-    #     sample_hms,
-    # )
-    # failures = []
-    # for (h, m), exp in expected_rows.items():
-    #     act = torch.from_numpy(actual_context[h, m, :]).bfloat16()
-    #     diff = (act.float() - exp.float()).abs()
-    #     rel = diff / (exp.float().abs() + 1e-6)
-    #     # An element fails only if it exceeds BOTH abs_tol and rel_tol
-    #     bad = (diff > ABS_TOL) & (rel > REL_TOL)
-    #     if bad.any():
-    #         failures.append(
-    #             f"(h={h}, m={m}): {int(bad.sum())}/{d} bad, "
-    #             f"max_abs={diff.max().item():.4f}, max_rel={rel.max().item():.4f}"
-    #         )
-    # assert not failures, "Sample verification failed:\n  " + "\n  ".join(failures)
+    # ---- Sample-based correctness check ----
+    # Pick a handful of random (head, row) pairs and recompute the expected
+    # attn_context row for each (cheap: O(S*d) per sample).
+    actual_context = _get_output_tensor(fc, "attn_context", (H, S, d))
+    rng = np.random.default_rng(seed=0)
+    n_samples = 16
+    sample_hms = [(int(rng.integers(0, H)), int(rng.integers(0, S))) for _ in range(n_samples)]
+    expected_rows = compute_attn_context_at_rows(
+        inputs["queries_deinterleaved"],
+        inputs["keys_for_scores"],
+        inputs["values_for_context"],
+        inputs["_scale"],
+        causal,
+        sample_hms,
+    )
+    failures = []
+    for (h, m), exp in expected_rows.items():
+        act = torch.from_numpy(actual_context[h, m, :]).bfloat16()
+        diff = (act.float() - exp.float()).abs()
+        rel = diff / (exp.float().abs() + 1e-6)
+        # An element fails only if it exceeds BOTH abs_tol and rel_tol
+        bad = (diff > ABS_TOL) & (rel > REL_TOL)
+        if bad.any():
+            failures.append(
+                f"(h={h}, m={m}): {int(bad.sum())}/{d} bad, "
+                f"max_abs={diff.max().item():.4f}, max_rel={rel.max().item():.4f}"
+            )
+    assert not failures, "Sample verification failed:\n  " + "\n  ".join(failures)
 
 
 # ---------------------------------------------------------------------------
