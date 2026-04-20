@@ -28,6 +28,7 @@ def _softmax_partial(
     tile_size,
     chunk_size,
     func_prefix="",
+    kernel_obj_file="softmax.o",
 ):
     """Online / tiled softmax that processes each row in sub-tile chunks.
 
@@ -76,17 +77,17 @@ def _softmax_partial(
     # --- Kernel declarations ------------------------------------------------
     init_kernel = Kernel(
         f"{func_prefix}softmax_partial_init_bf16",
-        f"{func_prefix}softmax.o",
+        f"{func_prefix}{kernel_obj_file}",
         [stats_ty],
     )
     stats_kernel = Kernel(
         f"{func_prefix}softmax_partial_stats_bf16",
-        f"{func_prefix}softmax.o",
+        f"{func_prefix}{kernel_obj_file}",
         [chunk_ty, stats_ty, np.int32],
     )
     norm_kernel = Kernel(
         f"{func_prefix}softmax_partial_norm_bf16",
-        f"{func_prefix}softmax.o",
+        f"{func_prefix}{kernel_obj_file}",
         [chunk_ty, chunk_ty, stats_ty, np.int32],
     )
 
@@ -145,7 +146,7 @@ def _softmax_partial(
         ]
 
     workers = [
-        Worker(core_body, _worker_args(i * num_channels + j))
+        Worker(core_body, _worker_args(i * num_channels + j), stack_size=0xD00)
         for i in range(num_aie_columns)
         for j in range(num_channels)
     ]
@@ -219,6 +220,7 @@ def softmax(
             tile_size,
             chunk_size,
             func_prefix,
+            kernel_obj_file,
         )
 
     # ---- Full-row softmax path (original) ----
