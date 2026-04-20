@@ -5,17 +5,19 @@
 A layer-by-layer (LxL) single-dispatch (SD) implementation of multi-head attention (MHA).
 """
 
+import math
+
 import aie.utils as aie_utils
 
 from iron.common.context import AIEContext
 from iron.common.fusion import FusedMLIROperator
+from iron.operators.axpy.op import AXPY
 from iron.operators.gemm.op import GEMM
 from iron.operators.rope.op import RoPE
 from iron.operators.strided_copy.op import StridedCopy
 from iron.operators.repeat.op import Repeat
 from iron.operators.softmax.op import Softmax
 from iron.operators.transpose.op import Transpose
-from iron.operators.elementwise_mul.op import ElementwiseMul
 from iron.operators.elementwise_add.op import ElementwiseAdd
 
 
@@ -75,19 +77,68 @@ def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True, num_cols=None):
         tile_n=_pick_tile_n(S, num_cols),
         context=elf_ctx,
     )
-    scale = ElementwiseMul(
+    # Scale by 1/sqrt(d) — uses AXPY in scale-only mode (add_y=False) so the
+    # scalar is baked into the kernel call instead of being passed as an
+    # H*S*S broadcast buffer.  At S=32K, H=12 this saves a 24 GB input.
+    scale = AXPY(
         size=H * S * S,
         tile_size=S * S // num_cols,
         num_aie_columns=num_cols,
+        scalar_factor=1.0 / math.sqrt(d),
+        add_y=False,
         context=elf_ctx,
     )
     if causal_mask:
-        mask = ElementwiseAdd(
-            size=H * S * S,
-            tile_size=S * S // num_cols,
-            num_aie_columns=num_cols,
-            context=elf_ctx,
-        )
+        # Apply causal mask via AXPY in scalar-add + causal-mask mode.  The
+        # kernel computes (in place) `Z[i,j] = -INF if (j > i within head)
+        # else Y[i,j]` using a tile-position idx_buffer.  This avoids
+        # materialising an H*S*S input mask buffer (saves 24 GB at S=32K).
+        # Single-core; tiles entirely below the diagonal still flow through
+        # DMA (kernel does only a copy in that case).
+        #
+        # Same BD-overflow workaround as for softmax: each invocation's
+        # transfer must fit under the compiler's int32 byte limit (< 2^30
+        # bf16 elements).
+        #   * If S² fits, each invocation processes some whole heads.
+        #   * Otherwise (S>=32K), split each head into `mask_subblocks`
+        #     row-range slices and emit one AXPY instance per row_offset.
+        MASK_MAX_ELEMENTS_PER_INV = (1 << 30) - 1
+        if S * S <= MASK_MAX_ELEMENTS_PER_INV:
+            # Multi-head batched: pick max heads/invocation that divides H.
+            heads_per_mask_inv = max(1, MASK_MAX_ELEMENTS_PER_INV // (S * S))
+            while H % heads_per_mask_inv != 0:
+                heads_per_mask_inv -= 1
+            mask_subblocks = 1
+            mask_rows_per_block = S
+        else:
+            # Sub-head: split each head into `mask_subblocks` row-range slices
+            # such that rows_per_block * S <= MASK_MAX_ELEMENTS_PER_INV.
+            heads_per_mask_inv = 1
+            mask_subblocks = (S * S + MASK_MAX_ELEMENTS_PER_INV - 1) // MASK_MAX_ELEMENTS_PER_INV
+            while S % mask_subblocks != 0:
+                mask_subblocks += 1
+            mask_rows_per_block = S // mask_subblocks
+            assert mask_rows_per_block * S <= MASK_MAX_ELEMENTS_PER_INV
+        n_mask_invocations = (H // heads_per_mask_inv) * mask_subblocks
+
+        # Build one AXPY instance per (row_offset) — same kernel/design
+        # parameters otherwise.  When mask_subblocks=1 there's exactly one.
+        mask_ops = [
+            AXPY(
+                size=heads_per_mask_inv * mask_rows_per_block * S,
+                tile_size=min(4096, S),
+                num_aie_columns=1,
+                scalar_factor=float("-inf"),
+                mul_x=False,
+                add_y=True,
+                causal_mask=True,
+                mask_block_dim=S,
+                rows_per_block=mask_rows_per_block,
+                row_offset=sub_idx * mask_rows_per_block,
+                context=elf_ctx,
+            )
+            for sub_idx in range(mask_subblocks)
+        ]
     # Use online/partial softmax when full-row tiles would exhaust AIE local
     # memory (each double-buffered FIFO pair uses 4 * tile_size bytes; at
     # S >= 8192 the in+out FIFOs alone consume the full 64 KB data memory).
@@ -171,16 +222,15 @@ def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True, num_cols=None):
     #   step 3 (mask):     [R: scaled,  W: masked]   (causal only)
     #   step 4 (softmax):  [R: masked/scaled, W: weights]
     #   step 5 (context):  [R: weights]
-    # Each step's input and output need to be distinct buffers, but
-    # non-adjacent buffers can share storage.  Two physical slots A and B
-    # suffice in either causal or nomask configuration, cutting scratch for
-    # the (H,S,S) matrices from 3-4× to 2× H*S*S*B.
-    if causal_mask:
-        scores_buf, scaled_buf = "attn_A", "attn_B"
-        masked_buf, weights_buf = "attn_A", "attn_B"
-    else:
-        scores_buf, scaled_buf = "attn_A", "attn_B"
-        weights_buf = "attn_A"
+    # Every operator in the chain (scale, mask, softmax) processes data
+    # tile-by-tile through a producer/consumer FIFO pair, where each tile
+    # is read into the input FIFO BEFORE the kernel writes the output, and
+    # the output DMA only writes after the worker releases the tile.  This
+    # makes them safe to run in-place (input and output bound to the same
+    # DDR buffer): one logical (H,S,S) buffer suffices for the entire
+    # attention-matrix lifetime.
+    attn_buf = "attn"
+    scores_buf = scaled_buf = masked_buf = weights_buf = attn_buf
 
     score_calls = [
         (
@@ -221,13 +271,39 @@ def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True, num_cols=None):
 
     runlist = [
         *score_calls,
-        (scale, scores_buf, "attn_scale_factor", scaled_buf),
+        (scale, scores_buf, scaled_buf),
     ]
 
     if causal_mask:
-        runlist += [
-            (mask, scaled_buf, "causal_mask", masked_buf),
-        ]
+        # AXPY causal-mask mode takes only (input, output) — the mask values
+        # are baked into the kernel call (scalar -INF), no buffer needed.
+        # Multiple invocations on disjoint slices when needed to stay under
+        # the BD-length compiler-overflow limit.  Layout per invocation:
+        #   * Multi-head:  contiguous range of heads_per_mask_inv whole heads
+        #                  (mask_subblocks == 1, rows_per_block == S)
+        #   * Sub-head:    contiguous range of mask_rows_per_block rows
+        #                  starting at sub_idx * mask_rows_per_block within
+        #                  one head; emitted for every head × every sub-block
+        n_head_groups = H // heads_per_mask_inv
+        head_group_bytes = heads_per_mask_inv * S * S * B  # full head-group span
+        sub_chunk_bytes = mask_rows_per_block * S * B
+        mask_calls = []
+        for g in range(n_head_groups):
+            for sub_idx in range(mask_subblocks):
+                start = g * head_group_bytes + sub_idx * sub_chunk_bytes
+                end = start + heads_per_mask_inv * sub_chunk_bytes
+                mask_calls.append(
+                    (
+                        mask_ops[sub_idx],
+                        f"{scaled_buf}[{start}:{end}]",
+                        f"{masked_buf}[{start}:{end}]",
+                    )
+                )
+        if n_head_groups == 1 and mask_subblocks == 1:
+            # Whole-buffer fast path (avoids slice notation in MLIR)
+            runlist += [(mask_ops[0], scaled_buf, masked_buf)]
+        else:
+            runlist += mask_calls
 
     runlist += softmax_calls
     runlist += context_calls
@@ -236,8 +312,9 @@ def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True, num_cols=None):
         "queries": H * S * d * B,
         "keys": H * d * S * B,
         "values": H * S * d * B,
-        "attn_A": H * S * S * B,
-        "attn_B": H * S * S * B,
+        # Single in-place attention-matrix scratch buffer (see live-range
+        # comment above); shared across scores → scaled → masked → weights.
+        "attn": H * S * S * B,
         "attn_context": H * S * d * B,
     }
 
@@ -283,9 +360,7 @@ class AttentionPrefillFused(FusedMLIROperator):
         )
 
         mask_suffix = "_causal" if causal_mask else "_nomask"
-        input_args = ["queries", "keys", "values", "attn_scale_factor"]
-        if causal_mask:
-            input_args.append("causal_mask")
+        input_args = ["queries", "keys", "values"]
 
         super().__init__(
             name=f"attention_prefill_fused_{num_heads}h{num_kv_groups}g{head_dim}d{embedding_dim}e{seq_len}s{mask_suffix}",
@@ -491,10 +566,7 @@ class AttentionPrefillProjectedFused(FusedMLIROperator):
             "W_key",
             "W_value",
             "W_output",
-            "attn_scale_factor",
         ]
-        if causal_mask:
-            input_args.append("causal_mask")
 
         super().__init__(
             name=f"attention_prefill_projected_fused_{H}h{G}g{d}d{E}e{S}s{mask_suffix}",

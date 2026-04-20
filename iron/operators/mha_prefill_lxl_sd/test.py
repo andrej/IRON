@@ -126,8 +126,6 @@ def test_mha_pefill_lxl_sd(H, G, d, E, S):
     _load_input(fc, "queries", golden["queries_deinterleaved"])
     _load_input(fc, "keys", golden["keys_for_scores"])
     _load_input(fc, "values", golden["values_for_context"])
-    _load_input(fc, "attn_scale_factor", golden["attn_scale_factor"])
-    _load_input(fc, "causal_mask", golden["causal_mask"])
 
     fc()
 
@@ -173,8 +171,6 @@ def test_attention_prefill_projected_fused(H, G, d, E, S):
     _load_input(fc, "W_key", golden["W_key"])
     _load_input(fc, "W_value", golden["W_value"])
     _load_input(fc, "W_output", golden["W_output"])
-    _load_input(fc, "attn_scale_factor", golden["attn_scale_factor"])
-    _load_input(fc, "causal_mask", golden["causal_mask"])
 
     fc()
 
@@ -213,9 +209,6 @@ def test_mha_prefill_benchmark(H, G, d, E, S, causal, dispatch):
     _load_input(fc, "queries", inputs["queries_deinterleaved"])
     _load_input(fc, "keys", inputs["keys_for_scores"])
     _load_input(fc, "values", inputs["values_for_context"])
-    _load_input(fc, "attn_scale_factor", inputs["attn_scale_factor"])
-    if causal:
-        _load_input(fc, "causal_mask", inputs["causal_mask"])
 
     fc()
 
@@ -284,8 +277,6 @@ def test_mha_pefill_lxl_sd_intermediates(H, G, d, E, S):
     _load_input(fc, "queries", golden["queries_deinterleaved"])
     _load_input(fc, "keys", golden["keys_for_scores"])
     _load_input(fc, "values", golden["values_for_context"])
-    _load_input(fc, "attn_scale_factor", golden["attn_scale_factor"])
-    _load_input(fc, "causal_mask", golden["causal_mask"])
 
     fc()
 
