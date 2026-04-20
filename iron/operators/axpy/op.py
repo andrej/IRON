@@ -88,14 +88,30 @@ class AXPY(BinaryElementwiseOperator):
                     f"size ({self.size}) must be a multiple of "
                     f"rows_per_block * mask_block_dim ({block_elements})"
                 )
-            # Multi-core split is block-aligned (each core handles whole
-            # blocks).  num_aie_columns must divide num_blocks.
+            # Multi-core split: either block-aligned (each core handles
+            # whole blocks; num_aie_columns must divide num_blocks) or
+            # within-block (num_blocks == 1; num_aie_columns must divide
+            # rows_per_block).
             num_blocks = self.size // block_elements
-            if num_blocks % self.num_aie_columns != 0:
-                raise ValueError(
-                    f"AXPY causal_mask: num_aie_columns ({self.num_aie_columns}) "
-                    f"must divide num_blocks ({num_blocks})"
-                )
+            if num_blocks >= self.num_aie_columns:
+                if num_blocks % self.num_aie_columns != 0:
+                    raise ValueError(
+                        f"AXPY causal_mask block-aligned split: "
+                        f"num_aie_columns ({self.num_aie_columns}) must "
+                        f"divide num_blocks ({num_blocks})"
+                    )
+            else:
+                if num_blocks != 1:
+                    raise ValueError(
+                        f"AXPY causal_mask within-block split requires "
+                        f"num_blocks == 1, got {num_blocks}"
+                    )
+                if self.rows_per_block % self.num_aie_columns != 0:
+                    raise ValueError(
+                        f"AXPY causal_mask within-block split: "
+                        f"rows_per_block ({self.rows_per_block}) must be a "
+                        f"multiple of num_aie_columns ({self.num_aie_columns})"
+                    )
         super().__post_init__()
 
     def get_arg_spec(self) -> list[AIERuntimeArgSpec]:

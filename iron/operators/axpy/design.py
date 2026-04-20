@@ -208,18 +208,43 @@ def _my_axpy_causal_mask(
         )
     num_blocks = num_elements // block_elements
 
-    # Multi-core parallelisation: each core processes a contiguous slice of
-    # whole blocks (heads).  The kernel's mask logic depends only on
-    # row_in_block, which resets at every block boundary, so as long as
-    # cores split block-aligned the same kernel works unchanged.
-    if num_blocks % num_columns != 0:
-        raise ValueError(
-            f"num_blocks ({num_blocks}) must be a multiple of num_columns "
-            f"({num_columns}); causal_mask multi-core split is block-aligned"
-        )
-    blocks_per_core = num_blocks // num_columns
-    elements_per_core = blocks_per_core * block_elements
-    init_row = row_offset
+    # Two parallelisation modes:
+    #  * block-aligned (num_blocks >= num_columns): each core handles
+    #    blocks_per_core whole (S, S) blocks; idx[1] resets to row_offset at
+    #    every block boundary (same value on every core).
+    #  * within-block (num_blocks == 1, num_columns > 1): a single block is
+    #    too big to split across cores by block, so each core handles a
+    #    contiguous row-range slice of that one block; per-core init_row is
+    #    row_offset + core_idx * rows_per_iter (different per core).  The
+    #    kernel logic is unchanged — it only cares about (chunk_start_col,
+    #    row_in_block).
+    if num_blocks >= num_columns:
+        if num_blocks % num_columns != 0:
+            raise ValueError(
+                f"num_blocks ({num_blocks}) must be a multiple of num_columns "
+                f"({num_columns}); causal_mask multi-core split is block-aligned"
+            )
+        blocks_per_core = num_blocks // num_columns
+        rows_per_iter = rows_per_block
+        per_core_init_rows = [row_offset] * num_columns
+    else:
+        if num_blocks != 1:
+            raise ValueError(
+                f"causal_mask multi-core within-block split requires "
+                f"num_blocks == 1, got {num_blocks}"
+            )
+        if rows_per_block % num_columns != 0:
+            raise ValueError(
+                f"rows_per_block ({rows_per_block}) must be a multiple of "
+                f"num_columns ({num_columns}) for within-block split"
+            )
+        blocks_per_core = 1
+        rows_per_iter = rows_per_block // num_columns
+        per_core_init_rows = [
+            row_offset + i * rows_per_iter for i in range(num_columns)
+        ]
+
+    elements_per_core = num_elements // num_columns
 
     dtype = bfloat16
     tensor_ty = np.ndarray[(num_elements,), np.dtype[dtype]]
@@ -243,27 +268,31 @@ def _my_axpy_causal_mask(
         for i in range(num_columns)
     ]
 
-    def core_body(of_in_, of_out_, k, idx):
-        # idx[0] = chunk_start_col within the current row of the (S, S) block
-        # idx[1] = current row index within the current block
-        idx[0] = 0
-        idx[1] = init_row
-        for _ in range_(blocks_per_core):
-            for _ in range_(rows_per_block):
-                for _ in range_(chunks_per_row):
-                    elem_in = of_in_.acquire(1)
-                    elem_out = of_out_.acquire(1)
-                    k(elem_in, elem_out, idx, factor, per_tile_elements)
-                    of_in_.release(1)
-                    of_out_.release(1)
-                    idx[0] = idx[0] + per_tile_elements
-                idx[0] = 0
-                idx[1] = idx[1] + 1
-            idx[1] = init_row  # reset for next block
+    # Build one core_body per worker so the per-core init_row can be baked
+    # into the closure (constant within the worker code).
+    def make_core_body(my_init_row):
+        def core_body(of_in_, of_out_, k, idx):
+            # idx[0] = chunk_start_col within the current row of the block
+            # idx[1] = current row index within the current block
+            idx[0] = 0
+            idx[1] = my_init_row
+            for _ in range_(blocks_per_core):
+                for _ in range_(rows_per_iter):
+                    for _ in range_(chunks_per_row):
+                        elem_in = of_in_.acquire(1)
+                        elem_out = of_out_.acquire(1)
+                        k(elem_in, elem_out, idx, factor, per_tile_elements)
+                        of_in_.release(1)
+                        of_out_.release(1)
+                        idx[0] = idx[0] + per_tile_elements
+                    idx[0] = 0
+                    idx[1] = idx[1] + 1
+                idx[1] = my_init_row  # reset for next block
+        return core_body
 
     workers = [
         Worker(
-            core_body,
+            make_core_body(per_core_init_rows[i]),
             [of_ins[i].cons(), of_outs[i].prod(), kernel, idx_buffers[i]],
         )
         for i in range(num_columns)

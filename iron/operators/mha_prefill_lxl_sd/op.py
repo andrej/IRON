@@ -125,14 +125,20 @@ def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True, num_cols=None,
             assert mask_rows_per_block * S <= MASK_MAX_ELEMENTS_PER_INV
         n_mask_invocations = (H // heads_per_mask_inv) * mask_subblocks
 
-        # Multi-core parallelism for the AXPY causal mask: each core handles
-        # whole blocks (heads), so num_aie_columns must divide
-        # heads_per_mask_inv.  Pick the largest divisor <= device cols.
-        # Sub-head mode (mask_subblocks > 1) implies heads_per_mask_inv == 1
-        # so we're forced to a single core there.
-        mask_num_cols = min(num_cols, heads_per_mask_inv)
-        while heads_per_mask_inv % mask_num_cols != 0:
-            mask_num_cols -= 1
+        # Multi-core parallelism for the AXPY causal mask:
+        #  * Block-aligned (heads_per_mask_inv >= 2): each core handles whole
+        #    blocks (heads), so num_aie_columns must divide heads_per_mask_inv.
+        #  * Within-block (heads_per_mask_inv == 1, sub-head mode): each core
+        #    handles a contiguous row-range slice of the one (S/N, S) block,
+        #    so num_aie_columns must divide mask_rows_per_block.
+        if heads_per_mask_inv >= 2:
+            mask_num_cols = min(num_cols, heads_per_mask_inv)
+            while heads_per_mask_inv % mask_num_cols != 0:
+                mask_num_cols -= 1
+        else:
+            mask_num_cols = num_cols
+            while mask_rows_per_block % mask_num_cols != 0:
+                mask_num_cols -= 1
 
         # Build one AXPY instance per (row_offset) — same kernel/design
         # parameters otherwise.  When mask_subblocks=1 there's exactly one.
@@ -236,28 +242,13 @@ def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True, num_cols=None,
     w_chunk = gemm_M_chunk * S * B          # weights chunk: (M_chunk, S)
     c_chunk = gemm_M_chunk * d * B          # context chunk: (M_chunk, d)
 
-    # ---- Scratch-buffer aliasing via live-range analysis ----
-    # The four logical (H,S,S) attention-matrix scratch buffers (scores,
-    # scaled, masked, weights) have non-overlapping live ranges in the
-    # runlist:
-    #   step 1 (score):    [W: scores]
-    #   step 2 (scale):    [R: scores,  W: scaled]
-    #   step 3 (mask):     [R: scaled,  W: masked]   (causal only)
-    #   step 4 (softmax):  [R: masked/scaled, W: weights]
-    #   step 5 (context):  [R: weights]
-    # Each step's input and output need to be distinct buffers, but
-    # non-adjacent buffers can share storage.  Two physical slots A and B
-    # suffice in either causal or nomask configuration.  (In principle each
-    # operator could run in-place on one shared buffer, but DMA channels
-    # reading and writing the same DDR buffer concurrently appear to
-    # serialise through the memory subsystem and hurt throughput at small/
-    # medium S, so we keep two slots here.)
-    if causal_mask:
-        scores_buf, scaled_buf = "attn_A", "attn_B"
-        masked_buf, weights_buf = "attn_A", "attn_B"
-    else:
-        scores_buf, scaled_buf = "attn_A", "attn_B"
-        weights_buf = "attn_A"
+    # In-place attn buffer: single (H, S, S) scratch slot used in-place
+    # throughout the chain (score → scale → [mask] → softmax → context).
+    # Halves scratch memory (24 GB instead of 48 at S=32K, H=12) and is
+    # also marginally faster than the 2-buffer aliasing version (better
+    # cache locality with one buffer touched repeatedly).
+    attn_buf = "attn"
+    scores_buf = scaled_buf = masked_buf = weights_buf = attn_buf
 
     score_calls = [
         (
@@ -340,8 +331,7 @@ def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True, num_cols=None,
         "queries": H * S * d * B,
         "keys": H * d * S * B,
         "values": H * S * d * B,
-        "attn_A": H * S * S * B,
-        "attn_B": H * S * S * B,
+        "attn": H * S * S * B,
         "attn_context": H * S * d * B,
     }
 
