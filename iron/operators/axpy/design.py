@@ -191,11 +191,6 @@ def _my_axpy_causal_mask(
       ``rows_per_block``-tall slice of one block starting at row_offset.
       Used at very long S where one (S, S) block exceeds the BD-length cap.
     """
-    if num_columns != 1:
-        raise ValueError(
-            f"causal_mask path requires num_columns=1, got {num_columns}"
-        )
-
     factor = scalar_factor
     S = mask_block_dim
     per_tile_elements = 4096 if tile_size > 4096 else tile_size
@@ -212,6 +207,18 @@ def _my_axpy_causal_mask(
             f"rows_per_block * S ({block_elements})"
         )
     num_blocks = num_elements // block_elements
+
+    # Multi-core parallelisation: each core processes a contiguous slice of
+    # whole blocks (heads).  The kernel's mask logic depends only on
+    # row_in_block, which resets at every block boundary, so as long as
+    # cores split block-aligned the same kernel works unchanged.
+    if num_blocks % num_columns != 0:
+        raise ValueError(
+            f"num_blocks ({num_blocks}) must be a multiple of num_columns "
+            f"({num_columns}); causal_mask multi-core split is block-aligned"
+        )
+    blocks_per_core = num_blocks // num_columns
+    elements_per_core = blocks_per_core * block_elements
     init_row = row_offset
 
     dtype = bfloat16
@@ -219,8 +226,8 @@ def _my_axpy_causal_mask(
     tile_ty = np.ndarray[(per_tile_elements,), np.dtype[dtype]]
     idx_ty = np.ndarray[(2,), np.dtype[np.int32]]
 
-    of_in = ObjectFifo(tile_ty, name="in0")
-    of_out = ObjectFifo(tile_ty, name="out0")
+    of_ins = [ObjectFifo(tile_ty, name=f"in{i}") for i in range(num_columns)]
+    of_outs = [ObjectFifo(tile_ty, name=f"out{i}") for i in range(num_columns)]
 
     kernel = Kernel(
         "scalar_add_causal_bf16",
@@ -228,17 +235,20 @@ def _my_axpy_causal_mask(
         [tile_ty, tile_ty, idx_ty, np.float32, np.int32],
     )
 
-    idx_buffer = Buffer(
-        initial_value=np.zeros((2,), dtype=np.int32),
-        name="causal_mask_idx",
-    )
+    idx_buffers = [
+        Buffer(
+            initial_value=np.zeros((2,), dtype=np.int32),
+            name=f"causal_mask_idx_{i}",
+        )
+        for i in range(num_columns)
+    ]
 
     def core_body(of_in_, of_out_, k, idx):
         # idx[0] = chunk_start_col within the current row of the (S, S) block
         # idx[1] = current row index within the current block
         idx[0] = 0
         idx[1] = init_row
-        for _ in range_(num_blocks):
+        for _ in range_(blocks_per_core):
             for _ in range_(rows_per_block):
                 for _ in range_(chunks_per_row):
                     elem_in = of_in_.acquire(1)
@@ -251,21 +261,32 @@ def _my_axpy_causal_mask(
                 idx[1] = idx[1] + 1
             idx[1] = init_row  # reset for next block
 
-    worker = Worker(core_body, [of_in.cons(), of_out.prod(), kernel, idx_buffer])
+    workers = [
+        Worker(
+            core_body,
+            [of_ins[i].cons(), of_outs[i].prod(), kernel, idx_buffers[i]],
+        )
+        for i in range(num_columns)
+    ]
 
-    tap = TensorAccessPattern(
-        (1, num_elements),
-        0,
-        [1, 1, 1, num_elements],
-        [0, 0, 0, 1],
-    )
+    taps = [
+        TensorAccessPattern(
+            (1, num_elements),
+            i * elements_per_core,
+            [1, 1, 1, elements_per_core],
+            [0, 0, 0, 1],
+        )
+        for i in range(num_columns)
+    ]
 
     rt = Runtime()
     with rt.sequence(tensor_ty, tensor_ty) as (A, C):
-        rt.start(worker)
+        rt.start(*workers)
         tg = rt.task_group()
-        rt.fill(of_in.prod(), A, tap, task_group=tg)
-        rt.drain(of_out.cons(), C, tap, wait=True, task_group=tg)
+        for i in range(num_columns):
+            rt.fill(of_ins[i].prod(), A, taps[i], task_group=tg)
+        for i in range(num_columns):
+            rt.drain(of_outs[i].cons(), C, taps[i], wait=True, task_group=tg)
         rt.finish_task_group(tg)
 
     return Program(dev, rt).resolve_program(SequentialPlacer())

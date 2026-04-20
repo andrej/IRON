@@ -88,12 +88,13 @@ class AXPY(BinaryElementwiseOperator):
                     f"size ({self.size}) must be a multiple of "
                     f"rows_per_block * mask_block_dim ({block_elements})"
                 )
-            # Causal-mask path is single-core (the runtime sequence walks the
-            # nested (blocks, rows, chunks) dimensions sequentially).
-            if self.num_aie_columns != 1:
+            # Multi-core split is block-aligned (each core handles whole
+            # blocks).  num_aie_columns must divide num_blocks.
+            num_blocks = self.size // block_elements
+            if num_blocks % self.num_aie_columns != 0:
                 raise ValueError(
-                    f"AXPY causal_mask=True requires num_aie_columns=1, got "
-                    f"{self.num_aie_columns}"
+                    f"AXPY causal_mask: num_aie_columns ({self.num_aie_columns}) "
+                    f"must divide num_blocks ({num_blocks})"
                 )
         super().__post_init__()
 

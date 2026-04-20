@@ -94,6 +94,8 @@ void scalar_add_causal_bf16(bfloat16 *restrict y, bfloat16 *restrict z, int32_t 
 {
     event0();
 
+    constexpr int VEC = 64;
+
     int32_t chunk_start_col = idx[0];
     int32_t row_in_head     = idx[1];
 
@@ -104,13 +106,35 @@ void scalar_add_causal_bf16(bfloat16 *restrict y, bfloat16 *restrict z, int32_t 
     if (mask_start > vector_size) mask_start = vector_size;
 
     bfloat16 s = (bfloat16)a;
+    ::aie::vector<bfloat16, VEC> s_v = ::aie::broadcast<bfloat16, VEC>(s);
     int j = 0;
 
-    // Unmasked region: copy y -> z
+    // ---- Unmasked region [0, mask_start): copy y -> z ----
+    // Vectorised body up to the largest VEC-aligned offset <= mask_start.
+    int mask_start_floor = (mask_start / VEC) * VEC;
+    for (; j < mask_start_floor; j += VEC) {
+        ::aie::vector<bfloat16, VEC> v = ::aie::load_v<VEC>(y + j);
+        ::aie::store_v(z + j, v);
+    }
+    // Scalar copy for the unmasked remainder (at most VEC - 1 elements).
     for (; j < mask_start; j++) {
         z[j] = y[j];
     }
-    // Masked region: write the scalar
+
+    // ---- Masked region [mask_start, vector_size): write scalar ----
+    // If mask_start isn't VEC-aligned, scalar-fill up to the next VEC
+    // boundary (or to vector_size, whichever is smaller).
+    int next_vec_boundary = ((j + VEC - 1) / VEC) * VEC;
+    if (next_vec_boundary > vector_size) next_vec_boundary = vector_size;
+    for (; j < next_vec_boundary; j++) {
+        z[j] = s;
+    }
+    // Vectorised body of the masked region.
+    for (; j + VEC <= vector_size; j += VEC) {
+        ::aie::store_v(z + j, s_v);
+    }
+    // Scalar tail when vector_size isn't VEC-aligned (in practice this
+    // doesn't fire since per_tile_elements is always a multiple of VEC).
     for (; j < vector_size; j++) {
         z[j] = s;
     }

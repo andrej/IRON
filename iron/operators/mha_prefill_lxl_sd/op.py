@@ -121,13 +121,22 @@ def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True, num_cols=None):
             assert mask_rows_per_block * S <= MASK_MAX_ELEMENTS_PER_INV
         n_mask_invocations = (H // heads_per_mask_inv) * mask_subblocks
 
+        # Multi-core parallelism for the AXPY causal mask: each core handles
+        # whole blocks (heads), so num_aie_columns must divide
+        # heads_per_mask_inv.  Pick the largest divisor <= device cols.
+        # Sub-head mode (mask_subblocks > 1) implies heads_per_mask_inv == 1
+        # so we're forced to a single core there.
+        mask_num_cols = min(num_cols, heads_per_mask_inv)
+        while heads_per_mask_inv % mask_num_cols != 0:
+            mask_num_cols -= 1
+
         # Build one AXPY instance per (row_offset) — same kernel/design
         # parameters otherwise.  When mask_subblocks=1 there's exactly one.
         mask_ops = [
             AXPY(
                 size=heads_per_mask_inv * mask_rows_per_block * S,
                 tile_size=min(4096, S),
-                num_aie_columns=1,
+                num_aie_columns=mask_num_cols,
                 scalar_factor=float("-inf"),
                 mul_x=False,
                 add_y=True,
@@ -222,15 +231,19 @@ def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True, num_cols=None):
     #   step 3 (mask):     [R: scaled,  W: masked]   (causal only)
     #   step 4 (softmax):  [R: masked/scaled, W: weights]
     #   step 5 (context):  [R: weights]
-    # Every operator in the chain (scale, mask, softmax) processes data
-    # tile-by-tile through a producer/consumer FIFO pair, where each tile
-    # is read into the input FIFO BEFORE the kernel writes the output, and
-    # the output DMA only writes after the worker releases the tile.  This
-    # makes them safe to run in-place (input and output bound to the same
-    # DDR buffer): one logical (H,S,S) buffer suffices for the entire
-    # attention-matrix lifetime.
-    attn_buf = "attn"
-    scores_buf = scaled_buf = masked_buf = weights_buf = attn_buf
+    # Each step's input and output need to be distinct buffers, but
+    # non-adjacent buffers can share storage.  Two physical slots A and B
+    # suffice in either causal or nomask configuration.  (In principle each
+    # operator could run in-place on one shared buffer, but DMA channels
+    # reading and writing the same DDR buffer concurrently appear to
+    # serialise through the memory subsystem and hurt throughput at small/
+    # medium S, so we keep two slots here.)
+    if causal_mask:
+        scores_buf, scaled_buf = "attn_A", "attn_B"
+        masked_buf, weights_buf = "attn_A", "attn_B"
+    else:
+        scores_buf, scaled_buf = "attn_A", "attn_B"
+        weights_buf = "attn_A"
 
     score_calls = [
         (
@@ -312,9 +325,8 @@ def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True, num_cols=None):
         "queries": H * S * d * B,
         "keys": H * d * S * B,
         "values": H * S * d * B,
-        # Single in-place attention-matrix scratch buffer (see live-range
-        # comment above); shared across scores → scaled → masked → weights.
-        "attn": H * S * S * B,
+        "attn_A": H * S * S * B,
+        "attn_B": H * S * S * B,
         "attn_context": H * S * d * B,
     }
 
