@@ -29,7 +29,8 @@ def _pick_tile_n(N, num_cols, max_tile_n=64):
     return tile_n
 
 
-def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True, num_cols=None):
+def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True, num_cols=None,
+                     disable_softmax=False):
     """Build core attention sub-ops and runlist (no projections/RoPE/GQA).
 
     Expects pre-processed inputs:
@@ -41,6 +42,9 @@ def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True, num_cols=None):
       attn_context: (H, S, d) — per-head context vectors
 
     If causal_mask=False, the elementwise-add masking step is omitted.
+
+    If disable_softmax=True, the softmax step is omitted (output is incorrect;
+    intended for performance-isolation benchmarks only).
     """
     if num_cols is None:
         num_cols = aie_utils.get_current_device().cols
@@ -187,15 +191,25 @@ def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True, num_cols=None):
         f"got total_rows={total_softmax_rows}, n_invocations={n_softmax_invocations}"
     )
 
+    # Parallelise softmax across cores: each core handles a row-aligned
+    # slice of the (rows_per_inv, S) data.  Pick the largest divisor of
+    # softmax_rows_per_inv that is <= num_cols.
+    softmax_num_cols = num_cols
+    while softmax_rows_per_inv % softmax_num_cols != 0:
+        softmax_num_cols -= 1
+
     softmax = Softmax(
         rows=softmax_rows_per_inv,
         cols=S,
-        num_aie_columns=1,
+        num_aie_columns=softmax_num_cols,
         num_channels=1,
         rtp_vector_size=S,
         chunk_size=softmax_chunk_size,
         context=elf_ctx,
     )
+    # Context GEMM is capped at 4 cores: with N=d=64, tile_n must be a
+    # multiple of 16 (matmul kernel constraint n % (2*t) == 0), so
+    # tile_n*num_aie_columns = 64 means num_aie_columns <= 4.
     gemm_context = GEMM(
         M=gemm_M_chunk,
         K=S,
@@ -318,7 +332,8 @@ def _build_core_ops(H, G, d, S, elf_ctx, causal_mask=True, num_cols=None):
         else:
             runlist += mask_calls
 
-    runlist += softmax_calls
+    if not disable_softmax:
+        runlist += softmax_calls
     runlist += context_calls
 
     buffer_sizes = {
@@ -349,6 +364,7 @@ class AttentionPrefillFused(FusedMLIROperator):
         causal_mask=True,
         context=None,
         dispatch="auto",
+        disable_softmax=False,
     ):
         assert head_dim == 64
         assert num_heads % num_kv_groups == 0
@@ -369,9 +385,12 @@ class AttentionPrefillFused(FusedMLIROperator):
             seq_len,
             elf_ctx,
             causal_mask=causal_mask,
+            disable_softmax=disable_softmax,
         )
 
         mask_suffix = "_causal" if causal_mask else "_nomask"
+        if disable_softmax:
+            mask_suffix += "_nosm"
         input_args = ["queries", "keys", "values"]
 
         super().__init__(
