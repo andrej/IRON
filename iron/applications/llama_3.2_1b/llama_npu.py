@@ -744,9 +744,16 @@ class AIELlamaOperators:
         self.decode.fused.get_buffer("W_out_head").torch_view()[:] = config.weights[
             "model.embed_tokens.weight"
         ].flatten()
-        self.decode.fused.input_buffer.to("npu")
-        self.decode.fused.scratch_buffer.to("npu")
-        self.decode.fused.output_buffer.to("npu")
+        # Force-sync all buffers to device after weight loading.
+        # torch_view() marks individual sub-buffers as "cpu", but the parent
+        # XRTTensor's device flag stays "npu" (from construction), making
+        # .to("npu") a no-op.  Calling _sync_to_device() unconditionally
+        # ensures the weights written to mapped memory are flushed to device.
+        for buf in [self.decode.fused.input_buffer,
+                    self.decode.fused.scratch_buffer,
+                    self.decode.fused.output_buffer]:
+            buf._sync_to_device()
+            buf.device = "npu"
 
 
 # Allocate buffers shared with NPU
