@@ -5,6 +5,7 @@ import numpy as np
 import ml_dtypes
 import ctypes
 from pathlib import Path
+import pyxrt
 from . import compilation as comp
 from .base import AIEOperatorBase, MLIROperator
 from .utils import XRTSubBuffer

@@ -282,7 +282,7 @@ class AIELlamaOperators:
         # Decode operator (everything temporally fused)
         # ##################################################################
 
-        elf_ctx = AIEContext(build_dir=f"build_decode_{config.n_layers}layers")
+        elf_ctx = AIEContext(build_dir=f"build_decode_{config.n_layers}layers_{'elf' if use_elf else 'xclbin'}")
 
         gemv_attn_query_op = GEMV(
             M=config.n_heads * config.head_dim,

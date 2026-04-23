@@ -562,6 +562,7 @@ class AieccXclbinInstsCompilationRule(AieccCompilationRule):
                 "--no-compile-host",
                 "--no-xchesscc",
                 "--no-xbridge",
+                "--expand-load-pdis",
                 "--peano",
                 str(self.peano_dir),
                 "--dynamic-objFifos",
