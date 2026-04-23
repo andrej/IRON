@@ -318,7 +318,69 @@ class FusedMLIROperator(AIEOperatorBase):
         return buf_type, offset, length
 
 
-class FusedXclbinCallable:
+class _FusedCallableBase:
+    """Shared buffer allocation and sub-buffer access for fused callables.
+
+    Both `FusedXclbinCallable` and `FusedFullELFCallable` need identical
+    input/output/scratch buffer allocation and the same `get_buffer()`
+    sub-buffer lookup logic.  This base class provides both.
+    """
+
+    def _allocate_buffers(self, op):
+        self.op = op
+        input_buffer_size, output_buffer_size, scratch_buffer_size = op.buffer_sizes
+        itemsize = np.dtype(ml_dtypes.bfloat16).itemsize
+
+        self.input_buffer = XRTTensor(
+            (max(input_buffer_size, itemsize) // itemsize,),
+            dtype=ml_dtypes.bfloat16,
+        )
+        self.output_buffer = XRTTensor(
+            (max(output_buffer_size, itemsize) // itemsize,),
+            dtype=ml_dtypes.bfloat16,
+        )
+        self.scratch_buffer = XRTTensor(
+            (max(scratch_buffer_size, itemsize) // itemsize,),
+            dtype=ml_dtypes.bfloat16,
+        )
+        self._buffer_cache = {}
+
+    def get_buffer(self, buffer_name):
+        """Return a sub-buffer view for the named buffer."""
+        if buffer_name in self._buffer_cache:
+            return self._buffer_cache[buffer_name]
+
+        buf_type, offset, length = self.op.get_layout_for_buffer(buffer_name)
+
+        if buf_type == "input":
+            main_buffer = self.input_buffer
+        elif buf_type == "output":
+            main_buffer = self.output_buffer
+        elif buf_type == "scratch":
+            main_buffer = self.scratch_buffer
+        else:
+            raise ValueError(
+                f"Unknown buffer type '{buf_type}' for buffer '{buffer_name}'"
+            )
+
+        itemsize = np.dtype(ml_dtypes.bfloat16).itemsize
+        sub_buffer = XRTSubBuffer(
+            parent_bo=main_buffer.buffer_object(),
+            offset_bytes=offset,
+            size_bytes=length,
+            shape=(length // itemsize,),
+            dtype=ml_dtypes.bfloat16,
+        )
+
+        self._buffer_cache[buffer_name] = sub_buffer
+        return sub_buffer
+
+    def fill_(self, buffer_name, value):
+        """Fill a named buffer with a scalar value."""
+        self.get_buffer(buffer_name).fill_(value)
+
+
+class FusedXclbinCallable(_FusedCallableBase):
     """Callable that runs a fused operator using the xclbin flow.
 
     Loads the xclbin, registers it with XRT, reads the instruction binary,
@@ -327,8 +389,6 @@ class FusedXclbinCallable:
     """
 
     def __init__(self, op):
-        self.op = op
-
         # Locate compiled artifacts
         xclbin_path = op.xclbin_artifact.filename
         insts_path = op.insts_artifact.filename
@@ -385,53 +445,7 @@ class FusedXclbinCallable:
         self._fixup_load_pdi_addresses()
 
         # Allocate shared input/output/scratch buffers
-        input_buffer_size, output_buffer_size, scratch_buffer_size = op.buffer_sizes
-        itemsize = np.dtype(ml_dtypes.bfloat16).itemsize
-
-        self.input_buffer = XRTTensor(
-            (max(input_buffer_size, itemsize) // itemsize,),
-            dtype=ml_dtypes.bfloat16,
-        )
-        self.output_buffer = XRTTensor(
-            (max(output_buffer_size, itemsize) // itemsize,),
-            dtype=ml_dtypes.bfloat16,
-        )
-        self.scratch_buffer = XRTTensor(
-            (max(scratch_buffer_size, itemsize) // itemsize,),
-            dtype=ml_dtypes.bfloat16,
-        )
-
-        self._buffer_cache = {}
-
-    def get_buffer(self, buffer_name):
-        """Return a sub-buffer view for the named buffer."""
-        if buffer_name in self._buffer_cache:
-            return self._buffer_cache[buffer_name]
-
-        buf_type, offset, length = self.op.get_layout_for_buffer(buffer_name)
-
-        if buf_type == "input":
-            main_buffer = self.input_buffer
-        elif buf_type == "output":
-            main_buffer = self.output_buffer
-        elif buf_type == "scratch":
-            main_buffer = self.scratch_buffer
-        else:
-            raise ValueError(
-                f"Unknown buffer type '{buf_type}' for buffer '{buffer_name}'"
-            )
-
-        itemsize = np.dtype(ml_dtypes.bfloat16).itemsize
-        sub_buffer = XRTSubBuffer(
-            parent_bo=main_buffer.buffer_object(),
-            offset_bytes=offset,
-            size_bytes=length,
-            shape=(length // itemsize,),
-            dtype=ml_dtypes.bfloat16,
-        )
-
-        self._buffer_cache[buffer_name] = sub_buffer
-        return sub_buffer
+        self._allocate_buffers(op)
 
     def _fixup_load_pdi_addresses(self):
         """Create an XRT buffer object for instructions and convert LOAD_PDI
@@ -572,63 +586,17 @@ class FullELFCallable:
         )
 
 
-class FusedFullELFCallable(FullELFCallable):
+class FusedFullELFCallable(_FusedCallableBase, FullELFCallable):
     def __init__(self, op, elf_data=None):
         if elf_data is None:
             elf_data = load_elf(op)
-        super().__init__(elf_data)
-
-        self.op = op
-        input_buffer_size, output_buffer_size, scratch_buffer_size = op.buffer_sizes
-        itemsize = np.dtype(ml_dtypes.bfloat16).itemsize
-
-        self.input_buffer = XRTTensor(
-            (max(input_buffer_size, itemsize) // itemsize,),
-            dtype=ml_dtypes.bfloat16,
-        )
-        self.output_buffer = XRTTensor(
-            (max(output_buffer_size, itemsize) // itemsize,),
-            dtype=ml_dtypes.bfloat16,
-        )
-        self.scratch_buffer = XRTTensor(
-            (max(scratch_buffer_size, itemsize) // itemsize,),
-            dtype=ml_dtypes.bfloat16,
-        )
-
-        self._buffer_cache = {}
-
-    def get_buffer(self, buffer_name):
-        if buffer_name in self._buffer_cache:
-            return self._buffer_cache[buffer_name]
-
-        buf_type, offset, length = self.op.get_layout_for_buffer(buffer_name)
-
-        if buf_type == "input":
-            main_buffer = self.input_buffer
-        elif buf_type == "output":
-            main_buffer = self.output_buffer
-        elif buf_type == "scratch":
-            main_buffer = self.scratch_buffer
-        else:
-            raise ValueError(
-                f"Unknown buffer type '{buf_type}' for buffer '{buffer_name}'"
-            )
-
-        itemsize = np.dtype(ml_dtypes.bfloat16).itemsize
-        sub_buffer = XRTSubBuffer(
-            parent_bo=main_buffer.buffer_object(),
-            offset_bytes=offset,
-            size_bytes=length,
-            shape=(length // itemsize,),
-            dtype=ml_dtypes.bfloat16,
-        )
-
-        self._buffer_cache[buffer_name] = sub_buffer
-        return sub_buffer
+        FullELFCallable.__init__(self, elf_data)
+        self._allocate_buffers(op)
 
     def __call__(self):
         self.input_buffer.to("npu")
-        super().__call__(
+        FullELFCallable.__call__(
+            self,
             self.input_buffer.buffer_object(),
             self.output_buffer.buffer_object(),
             self.scratch_buffer.buffer_object(),
