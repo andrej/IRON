@@ -483,11 +483,8 @@ class FusedXclbinCallable(_FusedCallableBase):
             self._patched_insts[addr_idx] = lo
             self._patched_insts[addr_idx + 1] = hi
 
-        # Force-sync the fixed-up instructions to the device.
-        # The XRTTensor constructor already set device="npu" and synced the
-        # initial data, so .to("npu") would be a no-op.  We modified the
-        # mapped memory directly above and must flush unconditionally.
-        self._insts_tensor._sync_to_device()
+        # Sync the fixed-up instructions to the device
+        self._insts_tensor.to("npu")
 
         # Store the bo on the kernel handle so the runtime reuses it
         self._kernel_handle.insts = self._patched_insts
@@ -512,21 +509,11 @@ class FusedXclbinCallable(_FusedCallableBase):
         """
         # Copy patched instruction words into the bo's mapped memory
         np.copyto(self._insts_bo_data, self._patched_insts)
-        # Force sync to device — bypass device-state tracking since the
-        # mapped memory was modified directly via np.copyto and the
-        # Tensor's device flag may already be "npu", making .to("npu")
-        # a no-op.
-        self._insts_tensor._sync_to_device()
-        self._insts_tensor.device = "npu"
+        # Sync to device
+        self._insts_tensor.to("npu")
 
     def __call__(self):
-        # Force-sync input buffer to device — host-side sub-buffer writes
-        # (e.g. token embeddings, RoPE angles) modify the mapped BO memory
-        # directly, but the Tensor's device flag stays "npu" from the
-        # initial setup sync, making .to("npu") a no-op.  We must
-        # unconditionally flush so the device sees the updated data.
-        self.input_buffer._sync_to_device()
-        self.input_buffer.device = "npu"
+        self.input_buffer.to("npu")
 
         buffers = [
             self.input_buffer,
