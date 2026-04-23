@@ -42,3 +42,6 @@ build_elf_4layers/
 build_elf_5layers/
 build_elf_6layers/
 build_elf_8layers/
+
+# Auto-detected build artifacts
+old_build_decode_16layers_xclbin/
