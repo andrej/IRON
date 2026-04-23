@@ -442,12 +442,10 @@ class FusedXclbinCallable:
           3. For each LOAD_PDI entry, convert address = bo_addr + relative_offset
           4. Write the fixed-up data back into the bo
         """
-        import pyxrt as _pyxrt
-
         group_id = self._kernel_handle.kernel.group_id(1)
         self._insts_tensor = XRTTensor(
             self._patched_insts,
-            flags=_pyxrt.bo.cacheable,
+            flags=pyxrt.bo.cacheable,
             group_id=group_id,
         )
         bo = self._insts_tensor.buffer_object()
