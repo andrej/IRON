@@ -124,3 +124,9 @@ class RMSNorm(MLIROperator):
             AIERuntimeArgSpec("out", (self.size // self.tile_size, self.tile_size))
         )
         return specs
+
+    def reference(self, x, w=None):
+        """CPU reference: row-wise RMS normalization, optionally weighted."""
+        from iron.operators.rms_norm.reference import reference
+
+        return reference(x, w=w, weighted=self.weighted)

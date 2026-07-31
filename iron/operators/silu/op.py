@@ -17,3 +17,8 @@ class SiLU(ChanneledUnaryOperator):
     kernel_fn_name: ClassVar[str] = "silu_bf16"
     callback_fn: ClassVar[str] = "my_silu"
     needs_lut_ops: ClassVar[bool] = True
+
+    def reference(self, x):
+        from iron.operators.silu.reference import reference
+
+        return reference(x)

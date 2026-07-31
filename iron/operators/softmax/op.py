@@ -27,7 +27,7 @@ class Softmax(MLIROperator):
     num_aie_columns: int = 1
     num_channels: int = 1
     rtp_vector_size: int | None = None
-    mask_patch_value: int = 0
+    vector_size_parameter: str | None = None
     context: object = field(default=None, repr=False)
 
     @property
@@ -67,7 +67,7 @@ class Softmax(MLIROperator):
                     "trace_size": 0,
                     "tile_size": self.cols,
                     "rtp_vector_size": self.rtp_vector_size,
-                    "mask_patch_value": self.mask_patch_value,
+                    "vector_size_parameter": self.vector_size_parameter,
                     "kernel_obj_file": self._kernel_link_file,
                 },
             ),
@@ -98,3 +98,14 @@ class Softmax(MLIROperator):
             AIERuntimeArgSpec("in", (self.size,)),
             AIERuntimeArgSpec("out", (self.size,)),
         ]
+
+    def reference(self, x):
+        """CPU reference: row-wise softmax over ``cols``.
+
+        Note: ignores the runtime ``vector_size_parameter`` (if any); the
+        reference always softmaxes over the full ``cols``. For decode-style
+        usage with a masked tail, the trailing positions will not match the
+        NPU output."""
+        from iron.operators.softmax.reference import reference
+
+        return reference(x.reshape(self.rows, self.cols))

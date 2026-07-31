@@ -15,22 +15,21 @@ void leaky_relu_vectorized_bf16(bfloat16 *restrict a,
 {
     event0();
 
-    auto it_in = aie::begin_restrict_vector<32>((bfloat16 *)a);
-    auto it_out = aie::begin_restrict_vector<32>((bfloat16 *)c);
+    auto it_in = aie::begin_restrict_vector<16>((bfloat16 *)a);
+    auto it_out = aie::begin_restrict_vector<16>((bfloat16 *)c);
 
     // Broadcast alpha to a vector
-    vector<bfloat16, 32> alpha_vec = aie::broadcast<bfloat16, 32>(alpha);
-    vector<bfloat16, 32> zeroes = aie::zeros<bfloat16, 32>();
+    vector<bfloat16, 16> alpha_vec = aie::broadcast<bfloat16, 16>(alpha);
 
-    // Backed by LeakyReLU.min_line_size (>= 64 elements) / vector width 32.
+    // Backed by LeakyReLU.min_line_size (>= 64 elements) / vector width 16.
     AIE_PREPARE_FOR_PIPELINING
-    AIE_LOOP_MIN_ITERATION_COUNT(2)
-    for (int i = 0; i < vector_size; i += 32) {
-        vector<bfloat16, 32> input = *it_in++;
+    AIE_LOOP_MIN_ITERATION_COUNT(4)
+    for (int i = 0; i < vector_size; i += 16) {
+        vector<bfloat16, 16> input = *it_in++;
         // Leaky RELU: f(x) = max(x, alpha * x) where alpha is typically 0.01
         // When alpha < 1: if x > 0 then x, else alpha * x
-        vector<bfloat16, 32> alpha_times_input = aie::mul(input, alpha_vec);
-        vector<bfloat16, 32> output = aie::max(input, alpha_times_input);
+        vector<bfloat16, 16> alpha_times_input = aie::mul(input, alpha_vec);
+        vector<bfloat16, 16> output = aie::max(input, alpha_times_input);
         *it_out++ = output;
     }
 

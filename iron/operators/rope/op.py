@@ -92,3 +92,16 @@ class RoPE(MLIROperator):
             AIERuntimeArgSpec("in", (self.angle_rows, self.cols)),  # angles
             AIERuntimeArgSpec("out", (self.rows, self.cols)),  # output
         ]
+
+    def reference(self, x, angles):
+        """CPU reference for RoPE.
+
+        Assumes ``angles`` holds interleaved [cos, sin, cos, sin, ...] pairs
+        along the last dim (length ``cols``).  Only ``method_type == 0``
+        (TWO_HALVES) is currently supported.
+
+        ``angles`` may have fewer rows than ``x``; in that case the angles
+        are tiled along the row dimension to match ``x``."""
+        from iron.operators.rope.reference import reference
+
+        return reference(x, angles, self.method_type, self.rows, self.cols)

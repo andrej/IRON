@@ -9,6 +9,7 @@ from .base import (
     CompilationArtifactGraph,
     CompilationArtifact,
     SourceArtifact,
+    MLIRArtifact,
     FullElfArtifact,
     XclbinArtifact,
     InstsBinArtifact,
@@ -23,10 +24,10 @@ from .base import (
     AieccCompilationRule,
     AieccFullElfCompilationRule,
     AieccXclbinInstsCompilationRule,
-    PeanoCompilationRule,
+    KernelCompilationRule,
     ArchiveCompilationRule,
 )
-from .fusion import (
-    FusedMLIRSource,
+from .sequence import (
+    SequenceMLIRArtifact,
     FusePythonGeneratedMLIRCompilationRule,
 )

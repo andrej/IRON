@@ -160,6 +160,12 @@ class GEMM(MLIROperator):
             ),  # output C
         ]
 
+    def reference(self, A, B):
+        """CPU reference: ``C = A @ B`` honoring ``b_col_maj`` / ``c_col_maj``."""
+        from iron.operators.gemm.reference import reference
+
+        return reference(A, B, self.b_col_maj, self.c_col_maj)
+
     def pad_A(self, A_np):
         """Pad A matrix to match operator dimensions (M, K)"""
         M, K = A_np.shape

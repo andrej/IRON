@@ -307,17 +307,23 @@ class SourceArtifact(CompilationArtifact):
     pass
 
 
+class MLIRArtifact(CompilationArtifact):
+    """Base class for artifacts whose file is an MLIR (.mlir) module usable as aiecc input.
+
+    ``_MLIRInputMixin.mlir_input`` locates the MLIR source of a downstream
+    target (elf/xclbin/insts.bin) by looking for a dependency of this type.
+    Using a shared base class (rather than name-checking) lets other modules
+    such as ``compilation/sequence.py`` opt in without creating an import cycle.
+    """
+
+
 class _MLIRInputMixin:
     """Mixin providing a mlir_input property that finds the MLIR source in dependencies."""
 
     @property
     def mlir_input(self):
         result = next(
-            (
-                d
-                for d in self.dependencies
-                if isinstance(d, (SourceArtifact, PythonGeneratedMLIRArtifact))
-            ),
+            (d for d in self.dependencies if isinstance(d, MLIRArtifact)),
             None,
         )
         if result is None:
@@ -392,7 +398,7 @@ class KernelArchiveArtifact(CompilationArtifact):
     pass
 
 
-class PythonGeneratedMLIRArtifact(CompilationArtifact):
+class PythonGeneratedMLIRArtifact(MLIRArtifact):
     def __init__(
         self,
         filename: str,
@@ -488,11 +494,9 @@ class GenerateMLIRFromPythonCompilationRule(CompilationRule):
         commands = []
         worklist = graph.get_worklist(PythonGeneratedMLIRArtifact)
         for artifact in worklist:
-            new_artifact = SourceArtifact(artifact.filename)
-            callback = partial(self.generate_mlir, new_artifact, artifact.generator)
+            callback = partial(self.generate_mlir, artifact, artifact.generator)
             commands.append(PythonCallbackCompilationCommand(callback))
-            new_artifact.available = True
-            graph.replace(artifact, new_artifact)
+            artifact.available = True
         return commands
 
     @staticmethod
@@ -503,10 +507,20 @@ class GenerateMLIRFromPythonCompilationRule(CompilationRule):
 
 
 class AieccCompilationRule(CompilationRule):
-    def __init__(self, build_dir, peano_dir, mlir_aie_dir, *args, **kwargs):
+    def __init__(
+        self, build_dir, peano_dir, mlir_aie_dir, use_chess=False, *args, **kwargs
+    ):
         self.build_dir = build_dir
-        self.aiecc_path = Path(mlir_aie_dir) / "bin" / "aiecc"
+        # AIECC_PATH lets a build point at a locally-built aiecc (e.g. a compiler under
+        # development) without replacing the installed one. Default = the installed aiecc.
+        _aiecc_override = os.environ.get("AIECC_PATH")
+        self.aiecc_path = (
+            Path(_aiecc_override)
+            if _aiecc_override
+            else Path(mlir_aie_dir) / "bin" / "aiecc"
+        )
         self.peano_dir = peano_dir
+        self.use_chess = use_chess
         super().__init__(*args, **kwargs)
 
 
@@ -522,12 +536,22 @@ class AieccFullElfCompilationRule(AieccCompilationRule):
             compile_cmd = [
                 str(self.aiecc_path),
                 "-v",
-                "-j1",
+                f"-j{os.environ.get('AIECC_JOBS', '1')}",
                 "--no-compile-host",
-                "--no-xchesscc",
-                "--no-xbridge",
-                "--peano",
-                str(self.peano_dir),
+            ]
+            if self.use_chess:
+                compile_cmd += [
+                    "--xchesscc",
+                    "--xbridge",
+                ]
+            else:
+                compile_cmd += [
+                    "--no-xchesscc",
+                    "--no-xbridge",
+                    "--peano",
+                    str(self.peano_dir),
+                ]
+            compile_cmd += [
                 "--expand-load-pdis",
                 "--generate-full-elf",
                 "--full-elf-name",
@@ -566,12 +590,22 @@ class AieccXclbinInstsCompilationRule(AieccCompilationRule):
             compile_cmd = [
                 str(self.aiecc_path),
                 "-v",
-                "-j1",
+                f"-j{os.environ.get('AIECC_JOBS', '1')}",
                 "--no-compile-host",
-                "--no-xchesscc",
-                "--no-xbridge",
-                "--peano",
-                str(self.peano_dir),
+            ]
+            if self.use_chess:
+                compile_cmd += [
+                    "--xchesscc",
+                    "--xbridge",
+                ]
+            else:
+                compile_cmd += [
+                    "--no-xchesscc",
+                    "--no-xbridge",
+                    "--peano",
+                    str(self.peano_dir),
+                ]
+            compile_cmd += [
                 "--dynamic-objFifos",
             ]
             do_compile_xclbin = mlir_source in mlir_sources_to_xclbins
@@ -645,23 +679,63 @@ def _find_tool(name, peano_dir, mlir_aie_dir):
     )
 
 
-class PeanoCompilationRule(CompilationRule):
-    def __init__(self, peano_dir, mlir_aie_dir, *args, **kwargs):
+def _tool_runs(path):
+    """True if the tool at `path` actually executes. Guards against a binary that
+    is present on disk but cannot run -- e.g. one whose shared-library
+    dependency fails to load, so it exits nonzero and emits nothing rather than
+    producing output."""
+    try:
+        return (
+            subprocess.run([str(path), "--version"], capture_output=True).returncode
+            == 0
+        )
+    except OSError:
+        return False
+
+
+def _find_working_tool(name, peano_dir, mlir_aie_dir):
+    """Like _find_tool, but skip candidates that are present-but-broken (fail to
+    run) and fall through to the next, ending at the system PATH copy.
+
+    _find_tool returns the FIRST *existing* binary even if it cannot run. Used
+    silently in a `nm | awk > map` pipeline such a binary yields an EMPTY symbol
+    map (the pipe's exit status is awk's, so nm's failure is masked) -> the
+    fusion symbol prefix is never applied -> `undefined symbol: <prefix><sym>`
+    at the per-core link."""
+    candidates = [
+        Path(peano_dir) / "bin" / name,
+        Path(mlir_aie_dir) / "bin" / name,
+    ]
+    for tool_name in (name, f"{name}-18"):
+        found = shutil.which(tool_name)
+        if found:
+            candidates.append(Path(found))
+    for candidate in candidates:
+        if candidate.is_file() and _tool_runs(candidate):
+            return str(candidate)
+    # Nothing ran cleanly: defer to _find_tool (existence-only) so the caller
+    # still gets a path, or its clear FileNotFoundError if none exists at all.
+    return _find_tool(name, peano_dir, mlir_aie_dir)
+
+
+class KernelCompilationRule(CompilationRule):
+    """Compile KernelObjectArtifacts using Peano (clang++) or xchesscc."""
+
+    def __init__(self, peano_dir, mlir_aie_dir, use_chess=False, *args, **kwargs):
         self.peano_dir = peano_dir
         self.mlir_aie_dir = mlir_aie_dir
+        self.use_chess = use_chess
         super().__init__(*args, **kwargs)
 
     def matches(self, artifacts):
         return any(artifacts.get_worklist(KernelObjectArtifact))
 
     def compile(self, artifacts):
-        clang_path = Path(self.peano_dir) / "bin" / "clang++"
         include_path = Path(self.mlir_aie_dir) / "include"
         worklist = artifacts.get_worklist(KernelObjectArtifact)
         commands = []
 
         kernel_dir = get_kernel_dir()
-        target = f"{kernel_dir}-none-unknown-elf"
         runtime_lib_include_path = (
             Path(self.mlir_aie_dir) / "aie_runtime_lib" / kernel_dir.upper()
         )
@@ -676,29 +750,40 @@ class PeanoCompilationRule(CompilationRule):
                 raise RuntimeError(
                     "Expected KernelObject dependency to be a C source file"
                 )
-            for extra_dep in list(artifact.dependencies)[1:]:
-                if not isinstance(extra_dep, SourceArtifact):
-                    raise RuntimeError(
-                        "Expected all KernelObject dependencies to be C source files"
-                    )
 
-            cmd = (
-                [
-                    str(clang_path),
-                    "-O2",
-                    "-std=c++20",
-                    f"--target={target}",
-                    "-Wno-parentheses",
-                    "-Wno-attributes",
-                    "-Wno-macro-redefined",
-                    "-Wno-empty-body",
-                    "-Wno-missing-template-arg-list-after-template-kw",
-                    f"-I{str(include_path)}",
-                    f"-I{str(runtime_lib_include_path)}",
-                ]
-                + artifact.extra_flags
-                + ["-c", source_file.filename, "-o", artifact.filename]
-            )
+            if self.use_chess:
+                wrapper_path = Path(self.mlir_aie_dir) / "bin" / "xchesscc_wrapper"
+                cmd = (
+                    [
+                        str(wrapper_path),
+                        kernel_dir,  # e.g. "aie2" or "aie2p"
+                        f"-I{str(include_path)}",
+                        f"-I{str(runtime_lib_include_path)}",
+                    ]
+                    + artifact.extra_flags
+                    + ["-c", source_file.filename, "-o", artifact.filename]
+                )
+            else:
+                clang_path = Path(self.peano_dir) / "bin" / "clang++"
+                target = f"{kernel_dir}-none-unknown-elf"
+                cmd = (
+                    [
+                        str(clang_path),
+                        "-O2",
+                        "-std=c++20",
+                        f"--target={target}",
+                        "-D__AIE_API_AIE_ADF_HPP__",
+                        "-Wno-parentheses",
+                        "-Wno-attributes",
+                        "-Wno-macro-redefined",
+                        "-Wno-empty-body",
+                        "-Wno-missing-template-arg-list-after-template-kw",
+                        f"-I{str(include_path)}",
+                        f"-I{str(runtime_lib_include_path)}",
+                    ]
+                    + artifact.extra_flags
+                    + ["-c", source_file.filename, "-o", artifact.filename]
+                )
 
             commands.append(ShellCompilationCommand(cmd))
             if artifact.rename_symbols:
@@ -712,11 +797,12 @@ class PeanoCompilationRule(CompilationRule):
     def _find_tool(self, name):
         return _find_tool(name, self.peano_dir, self.mlir_aie_dir)
 
+    def _find_working_tool(self, name):
+        return _find_working_tool(name, self.peano_dir, self.mlir_aie_dir)
+
     def _rename_symbols(self, artifact):
-        objcopy_path = self._find_tool("llvm-objcopy")
-        cmd = [
-            objcopy_path,
-        ]
+        objcopy_path = self._find_working_tool("llvm-objcopy")
+        cmd = [objcopy_path]
         for old_sym, new_sym in artifact.rename_symbols.items():
             cmd += [
                 "--redefine-sym",
@@ -726,17 +812,41 @@ class PeanoCompilationRule(CompilationRule):
         return [ShellCompilationCommand(cmd)]
 
     def _prefix_symbols(self, artifact, prefix):
-        objcopy_path = self._find_tool("llvm-objcopy")
-        nm_path = self._find_tool("llvm-nm")
+        objcopy_path = self._find_working_tool("llvm-objcopy")
+        nm_path = self._find_working_tool("llvm-nm")
         symbol_map_file = artifact.filename + ".symbol_map"
 
-        # Extract defined symbols and create symbol map
-        nm_cmd = [
-            "sh",
-            "-c",
-            f"{nm_path} --defined-only --extern-only {artifact.filename} | "
-            f"awk '{{print $3 \" {prefix}\" $3}}' > {symbol_map_file}",
-        ]
+        if os.name == "nt":
+            # Pure python code execution block wrapped cleanly for Windows
+            python_script = f"""
+import subprocess
+nm_cmd = [{repr(nm_path)}, '--defined-only', '--extern-only', {repr(artifact.filename)}]
+res = subprocess.run(nm_cmd, capture_output=True, text=True, check=True)
+lines = []
+for line in res.stdout.splitlines():
+    parts = line.strip().split()
+    if len(parts) >= 3:
+        sym = parts[-1]
+        lines.append(f"{{sym}} {prefix}{{sym}}\\n")
+with open({repr(symbol_map_file)}, 'w') as f:
+    f.writelines(lines)
+"""
+            nm_cmd = [sys.executable, "-c", python_script.strip()]
+        else:
+            # Extract defined symbols and build the redefine-syms map. Run nm to a
+            # file, THEN awk (joined by `&&`) rather than `nm | awk`: a pipe reports
+            # only awk's exit status, so a failing nm silently produces an EMPTY map
+            # and the prefix rename is skipped, surfacing much later as
+            # `undefined symbol: {prefix}<sym>` at the per-core link. With `&&` a
+            # failed nm aborts here loudly instead.
+            nm_cmd = [
+                "sh",
+                "-c",
+                f"{nm_path} --defined-only --extern-only {artifact.filename} "
+                f"> {symbol_map_file}.syms && "
+                f"awk '{{print $3 \" {prefix}\" $3}}' {symbol_map_file}.syms "
+                f"> {symbol_map_file}",
+            ]
 
         # Apply the renaming using the symbol map
         objcopy_cmd = [

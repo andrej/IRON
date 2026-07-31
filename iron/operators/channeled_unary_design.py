@@ -5,7 +5,6 @@ from ml_dtypes import bfloat16
 import numpy as np
 
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
-from aie.iron.placers import SequentialPlacer
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
 
@@ -71,9 +70,6 @@ def channeled_unary_design(
             of_out.release(1)
 
     # Create a worker to perform the task
-    # Large tile sizes (>4096) with LUT-based kernels need more stack space
-    # than the default 1024 bytes due to spilled vector temporaries.
-    worker_kwargs = {"stack_size": 0xD00} if line_size > 4096 else {}
     my_workers = [
         Worker(
             core_fn,
@@ -82,7 +78,6 @@ def channeled_unary_design(
                 of_outs[i * num_channels + j].prod(),
                 kernel_fcn,
             ],
-            **worker_kwargs,
         )
         for i in range(num_columns)
         for j in range(num_channels)
@@ -129,4 +124,4 @@ def channeled_unary_design(
         rt.finish_task_group(tg)
 
     # Place components and generate an MLIR module
-    return Program(dev, rt).resolve_program(SequentialPlacer())
+    return Program(dev, rt).resolve_program()

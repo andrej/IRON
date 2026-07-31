@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import numpy as np
+from aie.dialects.aie import get_target_model, WireBundle
 from aie.utils.hostruntime.xrtruntime.tensor import XRTTensor, xrt as _pyxrt
 
 
@@ -11,7 +12,13 @@ def get_shim_dma_limit(dev) -> int:
     Each shim tile exposes a fixed number of DMA source connections; summing
     across all shim tiles gives the device-wide ShimDMA budget.
     """
-    return sum(dev.get_num_connections(t, output=True) for t in dev.get_shim_tiles())
+    tm = get_target_model(dev.resolve())
+    return sum(
+        tm.get_num_source_shim_mux_connections(col, row, WireBundle.DMA)
+        for col in range(tm.columns())
+        for row in range(tm.rows())
+        if tm.is_shim_noc_or_pl_tile(col, row)
+    )
 
 
 def float_to_name(v: float) -> str:
@@ -42,7 +49,7 @@ class XRTSubBuffer(XRTTensor):
     The parent XRTTensor must remain alive as long as this sub-buffer is in use.
     """
 
-    def __init__(self, parent_bo, offset_bytes, size_bytes, shape, dtype):
+    def __init__(self, parent_bo, offset_bytes, size_bytes, shape, dtype, parent=None):
         """
         Args:
             parent_bo: The parent pyxrt.bo object.
@@ -50,10 +57,15 @@ class XRTSubBuffer(XRTTensor):
             size_bytes: Size of this sub-region in bytes.
             shape: Tuple giving the logical shape of this sub-buffer.
             dtype: numpy dtype for interpreting the buffer contents.
+            parent: The parent XRTTensor this sub-buffer views into. When given,
+                moving this sub-buffer between devices propagates the resulting
+                device state to the parent (they share the same memory), so a
+                later whole-parent sync stays consistent with the sub-views.
         """
         # Skip XRTTensor.__init__ (which would allocate a new bo); set base attrs directly.
         self.device = "npu"
         self.dtype = np.dtype(dtype)
+        self._parent = parent
         # TODO: replace with XRTTensor.__getitem__ slice support when available upstream
         self._bo = _pyxrt.bo(parent_bo, size_bytes, offset_bytes)
         self._shape = tuple(shape)
@@ -66,11 +78,52 @@ class XRTSubBuffer(XRTTensor):
 
     @property
     def data(self) -> np.ndarray:
+        # `.data` is the write handle for this sub-view. Callers get it to write fresh
+        # host data (inputs, resident weights), but numpy gives us no write hook, so we
+        # conservatively mark this sub-view AND its parent host-dirty ("cpu") on any
+        # access. That makes a subsequent parent `.to("npu")` actually fire the
+        # host->device sync -- otherwise the residency guard no-ops (device already
+        # "npu" from allocation) and the freshly written bytes never reach the device,
+        # so the op computes on stale init-zeros. A redundant re-read sync is cheap;
+        # a silently-skipped write sync is a correctness bug.
+        self.device = "cpu"
+        if self._parent is not None:
+            self._parent.device = "cpu"
         return self._data
 
     def buffer_object(self):
         """Return the underlying pyxrt.bo (required by NPUKernel)."""
         return self._bo
+
+    def to(self, target_device: str):
+        """Move this sub-buffer to ``target_device`` by syncing the whole parent.
+
+        The sub-buffer and its parent alias the same underlying memory. Rather
+        than syncing only this sub-region's bo (whose effect on the parent is
+        unclear), the parent's current residency is set to this sub-view's
+        residency and the *entire parent buffer* is synced. This makes the
+        behaviour explicit and consistent with a caller that writes a sub-view
+        and then pushes it to the device.
+
+        FIXME: This assumes a sub-buffer sync means a whole-parent sync, which
+        is ambiguous in XRT: it is unclear whether ``bo.sync()`` on a sub-buffer
+        transfers only its slice or the whole parent. Because we sync the whole
+        parent here, moving one sub-buffer to a device can clobber sibling
+        sub-buffers that view the same parent (e.g. a host->device sync will
+        overwrite the device side of a sibling whose fresh device data has not
+        been synced back to the host yet). Those siblings are not notified and
+        keep a now-stale ``device`` flag. Revisit once XRT's sub-buffer sync
+        semantics are pinned down (or track per-region dirtiness).
+        """
+        if self._parent is not None:
+            # Reflect this sub-view's current residency onto the parent (e.g.
+            # "cpu" after a torch_view() write) so the parent's own sync fires
+            # instead of no-opping, then sync the whole parent buffer.
+            self._parent.device = self.device
+            result = self._parent.to(target_device)
+            self.device = self._parent.device
+            return result
+        return super().to(target_device)
 
     @classmethod
     def from_parent(cls, parent, shape, offset_elements, length_elements, dtype):
@@ -87,4 +140,5 @@ class XRTSubBuffer(XRTTensor):
             size_bytes=length_elements * itemsize,
             shape=shape,
             dtype=dtype,
+            parent=parent,
         )
