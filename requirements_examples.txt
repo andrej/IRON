@@ -1,6 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (C) 2025 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# torchtune/torchao pull in torch transitively. Use the PyTorch CPU index (with
+# PyPI as an extra index for the remaining packages) so we never pick up a CUDA
+# build of torch here either.
+--index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
+
 tiktoken
 safetensors
 blobfile
