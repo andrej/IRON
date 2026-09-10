@@ -79,6 +79,22 @@ MIN_M = M_TILE * ROWS  # 256
 MIN_K = K_TILE  # 512
 
 
+def pack_b(B, tile_n):
+    """Reorder a row-major ``(K, N)`` weight matrix into the order the B fill
+    expects, as a flat tensor.
+
+    Each ``K_TILE x tile_n`` tile is emitted in t-block-major order -- the
+    odometer ``(n//T, k%S, k//S, n%T)``, outermost first -- with tiles ordered
+    by column stripe and then by k-block, so each fill is one contiguous read.
+    """
+    K, N = B.shape
+    if K % K_TILE or N % tile_n:
+        raise ValueError(f"B ({K}, {N}) must tile to ({K_TILE}, {tile_n}) to be packed")
+    t = B.reshape(K // K_TILE, K_TILE // S, S, N // tile_n, tile_n // T, T)
+    # (kb, kb8, s_in, cb, tb, t_in) -> (cb, kb, tb, s_in, kb8, t_in)
+    return t.permute(3, 0, 4, 2, 1, 5).reshape(-1).contiguous()
+
+
 def flm_gemm(
     dev,
     M,

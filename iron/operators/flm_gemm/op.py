@@ -25,8 +25,7 @@ from iron.operators.flm_gemm.design import (
     MIN_M,
     M_TILE,
     N_TILE_DEFAULT,
-    S,
-    T,
+    pack_b,
 )
 
 
@@ -242,15 +241,7 @@ class FLMGEMM(MLIROperator):
         its weights on the host for the same reason. Weights are packed once
         and reused across dispatches, so the cost belongs here.
         """
-        K, N = B.shape
-        N_TILE = self.tile_n
-        if K % K_TILE or N % N_TILE:
-            raise ValueError(
-                f"B ({K}, {N}) must tile to ({K_TILE}, {N_TILE}) to be packed"
-            )
-        t = B.reshape(K // K_TILE, K_TILE // S, S, N // N_TILE, N_TILE // T, T)
-        # (kb, kb8, s_in, cb, tb, t_in) -> (cb, kb, tb, s_in, kb8, t_in)
-        return t.permute(3, 0, 4, 2, 1, 5).reshape(-1).contiguous()
+        return pack_b(B, self.tile_n)
 
     def get_arg_spec(self):
         return [

@@ -14,6 +14,7 @@ _OPERATOR_MODULES = {
     "ElementwiseAdd": "elementwise_add",
     "ElementwiseMul": "elementwise_mul",
     "FLMGEMM": "flm_gemm",
+    "FLMGEMMPrebuilt": "flm_gemm_prebuilt",
     "GEMM": "gemm",
     "GEMV": "gemv",
     "MHA": "mha",

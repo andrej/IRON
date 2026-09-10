@@ -67,7 +67,6 @@ def test_flm_gemm(M, K, N, epilogue, clamp, rounding, aie_context):
         M=M, K=K, N=N, epilogue=epilogue, clamp=clamp, scale=scale
     )
 
-
     operator = FLMGEMM(
         M=M,
         K=K,

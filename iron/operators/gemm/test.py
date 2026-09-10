@@ -32,6 +32,14 @@ def get_params():
         ( 192,   384,    64,               4,     False,     False,  48,  96,  16,          0, 1),
         ( 192,   384,    64,               4,      True,      True,  48,  96,  16,          0, 1),
         (  64,   512,   256,               4,      True,     False,  16,  64,  64,          0, 4),
+        # The shapes iron/operators/flm_gemm and iron/operators/flm_gemm_prebuilt
+        # run, so all three GEMM implementations report a latency for the same
+        # problem. N=128 takes n=16 because this design splits N across all 8
+        # columns, where the other two give the whole block to one column.
+        ( 256,   512,  1024,               8,     False,     False,  64,  64,  64,          0, 1),
+        ( 512,  1024,  2048,               8,     False,     False,  64,  64,  64,          0, 1),
+        ( 256,   512,  1536,               8,     False,     False,  64,  64,  64,          0, 1),
+        ( 256,   512,   128,               8,     False,     False,  64,  64,  16,          0, 1),
     ]
     extensive_params = [
         (2048,  2048,  2048,               8,     False,     False,  32,  32, 128,          0, 1),
@@ -49,6 +57,11 @@ def get_params():
         (2048,  8192,  2048,               2,     False,      True,  64,  64,  64,          0, 1),
         (2048,    64,  2048,               2,     False,      True,  64,  64,  64,          0, 1),
         (2048,    64,  8192,               2,     False,      True,  64,  64,  64,          0, 1),
+        # The extensive shapes of flm_gemm and flm_gemm_prebuilt.
+        (1024,  2048,  2048,               8,     False,     False,  64,  64,  64,          0, 1),
+        (2048,  2048,  2048,               8,     False,     False,  64,  64,  64,          0, 1),
+        (1024,  2560,  2560,               8,     False,     False,  64,  64,  64,          0, 1),
+        ( 512,  1536,  1536,               8,     False,     False,  64,  64,  64,          0, 1),
     ]
     # fmt: on
 
