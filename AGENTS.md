@@ -143,8 +143,10 @@ reuse lint
    - `base.py`: Base classes (`AIEOperatorBase`, `MLIROperator`, `CompositeOperator`)
    - `compilation/base.py`: Artifact descriptions an `op.py` returns
    - `compilation/jit.py`: Bridge from those descriptions to mlir-aie's `CompilableDesign`
-   - `fusion.py`: Operator sequencing framework (`OperatorSequence`)
-   - `device_manager.py`: XRT device initialization and management (singleton pattern)
+   - `sequence.py`: Operator sequencing framework (`OperatorSequence`) and its dispatch policies
+   - `operator_bases.py`: Shared operator shapes (`ChanneledUnaryOperator`, `BinaryElementwiseOperator`)
+   - `device_utils.py`: `get_kernel_dir`, which maps the active device to its `aie_kernels/` directory
+   - `layout.py`: Tiled strided layouts
    - `context.py`: `AIEContext` for operator compilation/execution
    - `utils.py`: Helper functions (`torch_to_numpy`, `numpy_to_torch`)
    - `test_utils.py`: Test utilities (`verify_buffer`, `nearly_equal`)
@@ -199,14 +201,10 @@ many symbols the design calls in it.
 **AIEContext**: Manages compilation and runtime state
 
 - Compiler choice: `peano` (default) or `chess`
-- Device manager: Singleton for XRT resource sharing
 - Use `AIEContext(mlir_verbose=True)` for verbose MLIR output
 
-**Device Manager**: Singleton that manages XRT resources
-
-- Automatically initializes `pyxrt.device(0)`
-- Caches contexts and kernels per xclbin path
-- Shared across all operators to avoid resource conflicts
+**XRT device**: mlir-aie owns it. `aie.utils.DefaultNPURuntime._device` holds the
+one `pyxrt.device`, and every operator dispatches through it.
 
 ## Hardware Constraints
 
@@ -398,15 +396,16 @@ These utilities handle bfloat16 conversion correctly (avoiding float32 intermedi
 
 ## Debugging and Performance
 
-### Debug Mode
+### Dispatch Modes
 
-Disable XRT runlist for easier debugging (executes kernels individually):
+An `OperatorSequence` takes a `dispatch=` mode. Three of them help when a
+sequence gives a wrong result, because they narrow the failure to one operator:
 
-```python
-context = AIEContext(use_runlist=False)
-```
-
-This sacrifices performance but makes it easier to identify which kernel fails.
+- `"auto"` (default): resolves to `"fused"` on NPU2 and `"separate"` on NPU1
+- `"fused"`: one ELF, one dispatch. NPU2 only
+- `"separate"`: one xclbin per operator, invoked in turn. Reports which operator fails
+- `"reference"`: the CPU references only, with no NPU compilation
+- `"compare"`: the `"separate"` path, and after each step the operator's CPU reference on the NPU-produced inputs, logging the deviation
 
 ### Verbose MLIR Output
 
