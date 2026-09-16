@@ -18,7 +18,8 @@ from iron.common import (
 from aie.dialects.aie import get_target_model
 from aie.dialects._aie_enum_gen import AIEArch
 from iron.common.device_utils import get_kernel_dir
-from iron.common.compilation import InstsBinArtifact, XclbinArtifact
+from iron.common.compilation import build_compilable
+from aie.utils.npukernel import NPUKernel
 from iron.common.operator_bases import lut_based_ops_artifacts
 import aie.utils as aie_utils
 
@@ -326,32 +327,49 @@ class GEMM(MLIROperator):
             f"{self.name}.mlir", self.M, self.K, self.N, self.epilogue, self.clamp
         )
 
-    def set_up_artifacts(self) -> None:
-        kernels = self.get_kernel_artifacts()
+    def _config_compilable(self):
+        """The build that supplies the xclbin.
 
-        # Emitted at a reference shape and activation, so every shape sharing
-        # this configuration reuses it. No clamp, not this instance's bounds:
-        # they reach only the discarded runtime sequence.
+        Emitted at a reference shape and activation, so every shape sharing
+        this configuration addresses the same cache entry. No clamp, not this
+        instance's bounds: they reach only the discarded runtime sequence.
+        """
         config_mlir = self._mlir_artifact(
             f"{self.config_name}.mlir",
             *self._reference_shape,
             Epilogue.NONE,
             None,
         )
-        self.xclbin_artifact = XclbinArtifact(
-            f"{self.config_name}.xclbin",
-            mlir_input=config_mlir,
-            dependencies=[config_mlir] + kernels,
+        return build_compilable(
+            config_mlir.generator,
+            self.get_kernel_artifacts(),
+            use_chess=self.context.compiler == "chess",
         )
-        shape_mlir = self.get_mlir_artifact()
-        self.insts_artifact = InstsBinArtifact(
-            f"{self.name}.bin",
-            mlir_input=shape_mlir,
-            # aiecc compiles the cores on the way to an instruction stream, so
-            # this needs the kernel objects too.
-            dependencies=[shape_mlir] + kernels,
+
+    def compile(self):
+        self._config = self._config_compilable()
+        self._config.compile()
+        return super().compile()
+
+    @property
+    def xclbin_path(self):
+        """The xclbin this operator dispatches through."""
+        return self._config.get_artifacts()[0]
+
+    def get_callable(self):
+        xclbin_path, _ = self._config.get_artifacts()
+        _, insts_path = self.compilable.get_artifacts()
+        npu_kernel = NPUKernel(
+            xclbin_path=str(xclbin_path),
+            kernel_name="MLIR_AIE",
+            insts_path=str(insts_path),
         )
-        self.add_artifacts([self.xclbin_artifact, self.insts_artifact])
+        handle = aie_utils.DefaultNPURuntime.load(npu_kernel)
+
+        def call(*args):
+            return aie_utils.DefaultNPURuntime.run(handle, list(args))
+
+        return call
 
     def get_kernel_artifacts(self):
         kernel_dir = get_kernel_dir()

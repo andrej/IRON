@@ -65,9 +65,10 @@ class SequenceDispatch:
 
     * ``resolve(device)`` -- the only device-aware step; expands ``"auto"`` to
       a concrete policy and validates device requirements. Called once, at
-      ``set_up_artifacts()`` time (the device is not known at construction).
-    * ``set_up_artifacts(seq)`` -- registers the compile artifacts for this
-      mode on the owning sequence.
+      ``compile()`` time (the device is not known at construction).
+    * ``compile(seq)`` -- builds this mode's artifacts and returns the
+      ``CompilableDesign`` that holds the sequence's own work directory, or
+      None for a mode that compiles nothing.
     * ``make_callable(seq)`` -- returns the runtime callable for this mode.
     """
 
@@ -77,8 +78,8 @@ class SequenceDispatch:
         """Return the concrete policy for ``device`` (default: unchanged)."""
         return self
 
-    def set_up_artifacts(self, seq):
-        """Register the compile artifacts needed by this mode on ``seq``."""
+    def compile(self, seq):
+        """Build the artifacts this mode needs."""
         raise NotImplementedError
 
     def make_callable(self, seq):
@@ -97,12 +98,6 @@ class AutoDispatch(SequenceDispatch):
         return SeparateDispatch()
 
 
-def _trace_tag(seq):
-    """Tracing adds a runtime-sequence argument, so a traced build cannot reuse an
-    untraced one's ELF. Empty when untraced."""
-    return f"_traced{seq.trace_size}" if seq.trace_size else ""
-
-
 class FusedDispatch(SequenceDispatch):
     """Single-ELF dispatch (NPU2 only): all operators fused into one ELF."""
 
@@ -115,49 +110,58 @@ class FusedDispatch(SequenceDispatch):
             )
         return self
 
-    def set_up_artifacts(self, seq):
-        mlir_artifact = self.build_fused_mlir(seq)
-        kernel_objects = self._collect_kernel_artifacts(seq)
-        full_elf_artifact = comp.FullElfArtifact(
-            f"{seq.name}{_trace_tag(seq)}.elf",
-            mlir_input=mlir_artifact,
-            dependencies=[mlir_artifact] + kernel_objects,
-            extra_flags=seq.extra_flags,
-            trace_size=seq.trace_size,
+    def compile(self, seq):
+        compilable = comp.build_compilable(
+            self.build_fused_design(seq),
+            self._collect_kernel_artifacts(seq),
+            use_chess=seq.context.compiler == "chess",
+            full_elf=True,
+            aiecc_flags=self._aiecc_flags(seq),
         )
-        seq.add_artifacts([full_elf_artifact])
+        compilable.compile()
+        return compilable
 
-    def build_fused_mlir(self, seq):
-        """Build the fused MLIR source that inlines every operator into a single
-        module.
+    @staticmethod
+    def _aiecc_flags(seq):
+        flags = [
+            "--expand-load-pdis",
+            "--get-scratchpad-parameters",
+            *seq.extra_flags,
+        ]
+        if seq.trace_size:
+            # The trace parser reads the lowered module for the buffer layout
+            # and each design's traced tiles and events.
+            flags.append("--get-input-with-addresses")
+        return flags
+
+    def build_fused_design(self, seq):
+        """Build the design that inlines every operator into a single module.
 
         ``seq``'s buffer-layout attributes (``subbuffer_layout``,
         ``buffer_sizes``, ``slice_info``) must already be set.
         """
-        operator_mlir_map = {}
+        designs_by_name = {}
         comp_runlist = []
         designs, design_of = seq.unique_designs()
         design_names = []
 
         for idx, op in enumerate(designs):
-            mlir_artifact = op.get_mlir_artifact()
+            generator = op.get_mlir_artifact().generator
             if len(op.get_kernel_artifacts()) > 0:
-                mlir_artifact.generator.kwargs["func_prefix"] = f"op{idx}_"
+                generator.kwargs["func_prefix"] = f"op{idx}_"
             op_name = f"op{idx}_{op.__class__.__name__}"
             design_names.append(op_name)
-            operator_mlir_map[op_name] = mlir_artifact
+            designs_by_name[op_name] = generator
 
         for op, *bufs in seq.runlist:
             comp_runlist.append((design_names[design_of[id(op)]], *bufs))
 
-        return comp.SequenceMLIRArtifact(
-            f"{seq.name}{_trace_tag(seq)}_fused.mlir",
-            operator_mlir_map=operator_mlir_map,
+        return comp.SequenceDesign(
+            designs=designs_by_name,
             runlist=comp_runlist,
             subbuffer_layout=seq.subbuffer_layout,
             buffer_sizes=seq.buffer_sizes,
             slice_info=seq.slice_info,
-            trace_size=seq.trace_size,
         )
 
     def _collect_kernel_artifacts(self, seq):
@@ -167,7 +171,7 @@ class FusedDispatch(SequenceDispatch):
             objs = op.get_kernel_artifacts()
             for obj in objs:
                 obj.filename = f"op{idx}_{obj.filename}"
-                obj.prefix_symbols = f"op{idx}_"
+                obj.symbol_prefix = f"op{idx}_"
             kernel_artifacts.extend(objs)
         return kernel_artifacts
 
@@ -185,42 +189,35 @@ class SeparateDispatch(SequenceDispatch):
 
     def __init__(self):
         self.combined_xclbin = None
-        self.op_xclbin_map = {}  # id(op) -> xclbin artifact
-        self.op_insts_map = {}  # id(op) -> insts artifact
+        self.op_xclbin_map = {}  # id(op) -> xclbin path
+        self.op_insts_map = {}  # id(op) -> insts path
         self.op_kernel_name_map = {}  # id(op) -> kernel_name
 
-    def set_up_artifacts(self, seq):
+    def compile(self, seq):
         # Short hash keeps kernel names under xclbinutil's 64-char "name:name" limit.
         name_hash = hashlib.sha1(seq.name.encode()).hexdigest()[:6]
 
-        artifacts = []
-        prev_xclbin = None
+        previous_xclbin = None
         for idx, op in enumerate(seq.unique_operators()):
             op_label = f"f{name_hash}_op{idx}"
-            kernel_id = f"0x{0x901 + idx:x}"
-
-            xclbin, insts = op.get_artifacts(prefix=f"{op_label}_")
-            # Copy so we don't mutate the (possibly aliased) shared flags list.
-            xclbin.extra_flags = list(xclbin.extra_flags) + [
+            flags = [
+                f"--xclbin-kernel-name={op_label}",
                 f"--xclbin-instance-name={op_label}",
-                f"--xclbin-kernel-id={kernel_id}",
+                f"--xclbin-kernel-id=0x{0x901 + idx:x}",
             ]
-            xclbin.kernel_name = op_label
-
-            if prev_xclbin is not None:
-                xclbin.xclbin_input = prev_xclbin
-                xclbin.dependencies.add(prev_xclbin)
-
-            artifacts.append(insts)
+            if previous_xclbin is not None:
+                # Each xclbin links the previous one's instances in, so the last
+                # one carries them all. The path names the previous build's cache
+                # entry, which is keyed by its content, so this records the chain.
+                flags.append(f"--xclbin-input={previous_xclbin}")
+            xclbin, insts = op.build_compilable(aiecc_flags=flags).compile()
             self.op_xclbin_map[id(op)] = xclbin
             self.op_insts_map[id(op)] = insts
             self.op_kernel_name_map[id(op)] = op_label
-            prev_xclbin = xclbin
+            previous_xclbin = xclbin
 
-        # The last xclbin in the chain carries all the linked instances.
-        artifacts.append(prev_xclbin)
-        self.combined_xclbin = prev_xclbin
-        seq.add_artifacts(artifacts)
+        self.combined_xclbin = previous_xclbin
+        return None
 
     def make_callable(self, seq):
         return SequenceXclbinCallable(seq, self)
@@ -255,8 +252,8 @@ class ReferenceDispatch(SequenceDispatch):
 
     name = "reference"
 
-    def set_up_artifacts(self, seq):
-        pass
+    def compile(self, seq):
+        return None
 
     def make_callable(self, seq):
         return SequenceReferenceCallable(seq)
@@ -471,13 +468,14 @@ class OperatorSequence(AIEOperatorBase):
         buffer_sizes = (input_buffer_size, output_buffer_size, scratch_buffer_size)
         return subbuffer_layout, buffer_sizes, slice_info
 
-    def set_up_artifacts(self):
-        """Resolve the dispatch policy and build its compile artifacts."""
+    def compile(self):
+        """Resolve the dispatch policy and build what it needs."""
         self.subbuffer_layout, self.buffer_sizes, self.slice_info = (
             self.calculate_buffer_layout()
         )
         self._dispatch = self._dispatch.resolve(aie_utils.get_current_device())
-        self._dispatch.set_up_artifacts(self)
+        self.compilable = self._dispatch.compile(self)
+        return self
 
     def get_arg_spec(self):
         raise NotImplementedError(
@@ -589,8 +587,7 @@ class SequenceFullELFCallable(SequenceCallable):
         self.device_name = device_name
         self.sequence_name = sequence_name
 
-        assert isinstance(op.artifacts[0], comp.FullElfArtifact)
-        xrt_elf = pyxrt.elf(str(op.artifacts[0].filename))
+        xrt_elf = pyxrt.elf(str(op.elf_path))
         xrt_context = pyxrt.hw_context(aie_utils.DefaultNPURuntime._device, xrt_elf)
         self.xrt_kernel = pyxrt.ext.kernel(
             xrt_context, f"{self.device_name}:{self.sequence_name}"
@@ -616,16 +613,14 @@ class SequenceFullELFCallable(SequenceCallable):
 
         The ``params.txt`` describing the runtime parameters is requested from
         aiecc via ``--get-scratchpad-parameters``; it is a graph output, so it
-        lands in aiecc's ``--output-dir``, which compile_mlir_module() points at
-        the work dir (see ``_aiecc_work_dir``) for the fused MLIR source.
+        lands in aiecc's ``--output-dir``, which is the sequence's work dir.
         Returns ``None`` if the sequence declared no runtime parameters: the
         file is still written, but holds a count of zero and there is no ctrl
         scratchpad buffer object to bind to.
         """
         if self._params is not None:
             return self._params
-        mlir_filename = self.op.artifacts[0].mlir_input.filename
-        params_path = comp._aiecc_work_dir(mlir_filename) / "params.txt"
+        params_path = self.op.work_dir / "params.txt"
         if not params_path.exists():
             return None
         if params_path.read_text().split("\n", 1)[0].strip() == "0":
@@ -655,9 +650,7 @@ class SequenceFullELFCallable(SequenceCallable):
 
     def lowered_mlir_text(self) -> str:
         """aiecc's post-lowering module, which carries the trace buffer layout."""
-        mlir_filename = self.op.artifacts[0].mlir_input.filename
-        path = comp._aiecc_work_dir(mlir_filename) / "input_with_addresses.mlir"
-        return path.read_text()
+        return (self.op.work_dir / "input_with_addresses.mlir").read_text()
 
     def get_buffer(self, buffer_name):
         if buffer_name in self._buffer_cache:
@@ -767,13 +760,13 @@ class SequenceXclbinCallable(_PerBufferCallable):
     def _allocate_buffers(self):
         super()._allocate_buffers()
         dispatch = self._dispatch
-        combined_xclbin_path = dispatch.combined_xclbin.filename
+        combined_xclbin_path = str(dispatch.combined_xclbin)
         self._op_callable_map = {}  # id(op) -> NPUKernel
-        for op_id, xclbin in dispatch.op_xclbin_map.items():
+        for op_id, insts_path in dispatch.op_insts_map.items():
             self._op_callable_map[op_id] = NPUKernel(
                 xclbin_path=combined_xclbin_path,
                 kernel_name=dispatch.op_kernel_name_map[op_id],
-                insts_path=dispatch.op_insts_map[op_id].filename,
+                insts_path=str(insts_path),
             )
         self._execution_plan = [
             (

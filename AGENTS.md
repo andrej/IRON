@@ -37,13 +37,14 @@ python3 -m pip install -r requirements.txt
 
 **Note:** XRT must be sourced before running any tests or operators.
 
-### Build Directory
+### Compilation Cache
 
-Compiled artifacts (`.xclbin`, `.bin`, `.o` files) are stored in `build/` directory by default. The build directory can be customized via `AIEContext(build_dir="path/to/build")`.
+Compiled artifacts (`.o`, `.xclbin`, `.bin`, `.elf` files) land in `$NPU_CACHE_HOME`. mlir-aie keys each entry by a hash of the design's Python sources, its kernel sources and its compile flags, so an edit to any of them produces a new entry.
 
 ### Environment Variables
 
 - `IRON_EXAMPLE_WEIGHTS_DIR`: Path to model weights for applications (default: `/srv`)
+- `NPU_CACHE_HOME`: Directory for compiled artifacts (default: `~/.npu/cache`)
 
 ## Building and Testing
 
@@ -140,7 +141,8 @@ reuse lint
 
 3. **Common Infrastructure** (`iron/common/`)
    - `base.py`: Base classes (`AIEOperatorBase`, `MLIROperator`, `CompositeOperator`)
-   - `compilation/`: Compilation artifact system (MLIR → xclbin)
+   - `compilation/base.py`: Artifact descriptions an `op.py` returns
+   - `compilation/jit.py`: Bridge from those descriptions to mlir-aie's `CompilableDesign`
    - `fusion.py`: Operator sequencing framework (`OperatorSequence`)
    - `device_manager.py`: XRT device initialization and management (singleton pattern)
    - `context.py`: `AIEContext` for operator compilation/execution
@@ -176,21 +178,29 @@ reuse lint
 **Compilation Flow**:
 
 ```text
-design.py (Python MLIR-AIE API)
-    ↓
-PythonGeneratedMLIRArtifact
-    ↓
-MLIR (.mlir file)
-    ↓ (aie-opt + aie-translate via Peano toolchain)
-xclbin (NPU binary) + insts.bin (instruction sequence)
+op.py (PythonGeneratedMLIRArtifact + KernelObjectArtifact)
+    ↓ (iron/common/compilation/jit.py)
+CompilableDesign
+    ↓ runs design.py, compiles each declared ExternalFunction
+MLIR module + kernel objects
+    ↓ (aiecc, via Peano or chess)
+xclbin (NPU binary) + insts.bin (instruction sequence), or a full ELF
 ```
+
+mlir-aie compiles a design by running a generator function, then compiling
+every `ExternalFunction` that the generator registered while it ran. IRON's
+designs declare their kernels as `Kernel` objects, which name an object file
+but do not say how to build it. `build_design` in `compilation/jit.py` closes
+the gap: it runs the design, reads the `link_with` attribute off every core
+function to learn which object each symbol comes from, and declares the
+matching `ExternalFunction`. One declaration covers a whole object, however
+many symbols the design calls in it.
 
 **AIEContext**: Manages compilation and runtime state
 
-- Default build directory: `build/` in current working directory
-- Compilation rules: Defines pipeline from Python → MLIR → xclbin
+- Compiler choice: `peano` (default) or `chess`
 - Device manager: Singleton for XRT resource sharing
-- Use `AIEContext(build_dir="...", mlir_verbose=True)` for custom settings
+- Use `AIEContext(mlir_verbose=True)` for verbose MLIR output
 
 **Device Manager**: Singleton that manages XRT resources
 

@@ -10,7 +10,6 @@ from aie.utils.npukernel import NPUKernel
 from iron.common import (
     AIERuntimeArgSpec,
     DesignGenerator,
-    InstsBinArtifact,
     MLIROperator,
     PythonGeneratedMLIRArtifact,
     RemoteFileArtifact,
@@ -121,25 +120,24 @@ class MMPrebuilt(MLIROperator):
         # None to build: every core program is inside the downloaded xclbin.
         return []
 
-    def set_up_artifacts(self) -> None:
-        mlir_artifact = self.get_mlir_artifact()
-        self.insts_artifact = InstsBinArtifact(
-            f"{self.name}.bin",
-            mlir_input=mlir_artifact,
-            dependencies=[mlir_artifact],
-        )
-        self.xclbin_artifact = RemoteFileArtifact(
+    def compile(self):
+        super().compile()
+        # The overlay is a binary, so only the instruction stream is built here.
+        # It is downloaded into the same work dir, beside the xclbin aiecc made
+        # and which nothing uses.
+        self.xclbin_path = RemoteFileArtifact(
             f"flm_mm_{FASTFLOWLM_COMMIT[:8]}.xclbin",
             url=XCLBIN_URL,
             sha256=XCLBIN_SHA256,
-        )
-        self.add_artifacts([self.insts_artifact, self.xclbin_artifact])
+        ).fetch(self.work_dir)
+        return self
 
     def get_callable(self) -> Callable[..., Any]:
+        _, insts_path = self.compilable.get_artifacts()
         npu_kernel = NPUKernel(
-            xclbin_path=self.xclbin_artifact.filename,
+            xclbin_path=str(self.xclbin_path),
             kernel_name=XCLBIN_KERNEL_NAME,
-            insts_path=self.insts_artifact.filename,
+            insts_path=str(insts_path),
         )
         handle = aie_utils.DefaultNPURuntime.load(npu_kernel)
 

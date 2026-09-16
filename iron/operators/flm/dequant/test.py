@@ -179,8 +179,8 @@ def test_one_xclbin_serves_every_shape(aie_context):
         _check(op, blob, reference(qw, K, N), str(case))
 
         stamp = (
-            op.xclbin_artifact.filename,
-            os.path.getmtime(op.xclbin_artifact.filename),
+            op.xclbin_path,
+            os.path.getmtime(op.xclbin_path),
         )
         if xclbin is None:
             xclbin = stamp
