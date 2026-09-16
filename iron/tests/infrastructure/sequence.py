@@ -139,15 +139,11 @@ def test_fused_mlir_contains_reconfiguration(sequence, aie_context, tmp_path):
     seq = _build_add_relu_sequence(aie_context, "fused", "infra_fused_mlir")
 
     # Generate the fused MLIR directly, bypassing the ELF backend (which is
-    # NPU2-only). This mirrors what set_up_artifacts() feeds to the compiler.
+    # NPU2-only). This mirrors what compile() feeds to the compiler.
     seq.subbuffer_layout, seq.buffer_sizes, seq.slice_info = (
         seq.calculate_buffer_layout()
     )
-    mlir_artifact = seq._dispatch.build_fused_mlir(seq)
-    mlir_artifact.filename = str(tmp_path / mlir_artifact.filename)
-    fuse_mlir(mlir_artifact)
-
-    text = Path(mlir_artifact.filename).read_text()
+    text = fuse_mlir(seq._dispatch.build_fused_design(seq))
 
     # Reconfiguration + dispatch ops between temporal steps.
     assert "aiex.configure" in text, "missing aiex.configure in fused MLIR"

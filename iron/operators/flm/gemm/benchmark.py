@@ -149,7 +149,6 @@ class Candidate:
         self.round_medians = []
 
         op.compile()
-        self.xclbin = Path(op.xclbin_artifact.filename)
         self.c_bo = XRTTensor((M, N), dtype=np.dtype("bfloat16"))
         run = op.get_callable()
         # Only the flm operators take B pre-packed. iron.operators.GEMM reorders

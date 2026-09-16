@@ -62,7 +62,6 @@ class AIELlamaOperators:
 
     def __init__(self, config, prompt_len):
         self.context = AIEContext()
-        self.context.build_dir.mkdir(parents=True, exist_ok=True)
 
         self.prefill = AIEPrefillOperations()
         self.decode = AIEDecodeOperations()
@@ -274,7 +273,7 @@ class AIELlamaOperators:
         # Decode operator (everything temporally fused)
         # ##################################################################
 
-        elf_ctx = AIEContext(build_dir="build_elf")
+        elf_ctx = AIEContext()
 
         gemv_attn_query_op = GEMV(
             M=config.n_heads * config.head_dim,

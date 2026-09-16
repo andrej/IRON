@@ -15,17 +15,9 @@ from ml_dtypes import bfloat16
 import aie.utils as aie_utils
 from aie.utils.npukernel import NPUKernel
 
-from . import compilation as comp
 from .context import AIEContext
 from .utils import float_to_name
-from .compilation import (
-    CompilationArtifact,
-    XclbinArtifact,
-    InstsBinArtifact,
-    KernelObjectArtifact,
-    KernelArchiveArtifact,
-    SourceArtifact,
-)
+from .compilation import PythonGeneratedMLIRArtifact, build_compilable
 
 
 class AIEOperatorBase(ABC):
@@ -34,22 +26,10 @@ class AIEOperatorBase(ABC):
     _default_context: ClassVar[AIEContext | None] = None
 
     def __init__(self, context: AIEContext | None = None) -> None:
-        self.artifacts = comp.CompilationArtifactGraph()
         if context is None:
             context = self.get_default_context()
         self.context = context
-
-    @abstractmethod
-    def set_up_artifacts(self) -> None:
-        """
-        Declare the artifact dependency graph for this operator.
-
-        Subclasses must implement this method and call add_artifacts() to register
-        the artifacts they require. This method should only *describe* dependencies;
-        it must not perform any computation or compilation.  Compilation is triggered
-        separately via compile().
-        """
-        pass
+        self.compilable = None
 
     @abstractmethod
     def get_arg_spec(self) -> list[AIERuntimeArgSpec]:
@@ -59,6 +39,10 @@ class AIEOperatorBase(ABC):
     def get_callable(self) -> Callable[..., Any]:
         pass
 
+    @abstractmethod
+    def compile(self) -> "AIEOperatorBase":
+        """Build this operator's artifacts, reusing a cached build when one fits."""
+
     @classmethod
     def get_default_context(cls) -> AIEContext:
         """Return the process-wide default AIEContext, creating it on first call (lazy singleton)."""
@@ -66,25 +50,26 @@ class AIEOperatorBase(ABC):
             AIEOperatorBase._default_context = AIEContext()
         return AIEOperatorBase._default_context
 
-    def compile(self, dry_run: bool = False) -> AIEOperatorBase:
-        """
-        Set up the operator and compile any necessary artifacts.
-        Subclasses are expected to overwrite set_up_artifacts(); they may register any
-        artifacts that they need to be compiled there.
-        """
-        if not self.artifacts:
-            self.set_up_artifacts()
-        comp.compile(
-            self.context.compilation_rules,
-            self.artifacts,
-            self.context.build_dir,
-            dry_run=dry_run,
-        )
-        return self
+    @property
+    def work_dir(self) -> Path:
+        """Where the compiler left this operator's intermediate files.
 
-    def add_artifacts(self, artifacts: list[CompilationArtifact]) -> None:
-        for artifact in artifacts:
-            self.artifacts.add(artifact)
+        aiecc writes the lowered module and the runtime-parameter table here, so
+        tracing and parameter binding read it back after a build.
+        """
+        if self.compilable is None or self.compilable._kernel_dir is None:
+            raise RuntimeError(f"{type(self).__name__} has not been compiled yet")
+        return Path(self.compilable._kernel_dir)
+
+    @property
+    def elf_path(self) -> Path:
+        """The full ELF this operator dispatches through."""
+        if self.compilable is None or self.compilable._elf_path is None:
+            raise RuntimeError(
+                f"{type(self).__name__} has no full ELF; it was not compiled "
+                "with full_elf set"
+            )
+        return Path(self.compilable._elf_path)
 
 
 def _serialize_param(v: object) -> str:
@@ -148,42 +133,33 @@ class MLIROperator(AIEOperatorBase):
         return f"{base}_{dev.resolve().name}"
 
     @abstractmethod
-    def get_mlir_artifact(self) -> CompilationArtifact:
+    def get_mlir_artifact(self) -> PythonGeneratedMLIRArtifact:
         pass
 
     @abstractmethod
-    def get_kernel_artifacts(self) -> list[CompilationArtifact]:
+    def get_kernel_artifacts(self) -> list:
         pass
 
-    def get_artifacts(
-        self, prefix: str = ""
-    ) -> tuple[XclbinArtifact, InstsBinArtifact]:
-        operator_name = prefix + self.name
-        mlir_artifact = self.get_mlir_artifact()
-        kernel_deps = self.get_kernel_artifacts()
-        xclbin_artifact = XclbinArtifact(
-            f"{operator_name}.xclbin",
-            mlir_input=mlir_artifact,
-            dependencies=[mlir_artifact] + kernel_deps,
+    def build_compilable(self, *, full_elf: bool = False, aiecc_flags=()):
+        return build_compilable(
+            self.get_mlir_artifact().generator,
+            self.get_kernel_artifacts(),
+            use_chess=self.context.compiler == "chess",
+            full_elf=full_elf,
+            aiecc_flags=aiecc_flags,
         )
-        insts_artifact = InstsBinArtifact(
-            f"{operator_name}.bin",
-            mlir_input=mlir_artifact,
-            dependencies=[mlir_artifact],
-        )
-        return xclbin_artifact, insts_artifact
 
-    def set_up_artifacts(self) -> None:
-        xclbin_artifact, insts_artifact = self.get_artifacts()
-        self.xclbin_artifact = xclbin_artifact
-        self.insts_artifact = insts_artifact
-        self.add_artifacts([xclbin_artifact, insts_artifact])
+    def compile(self) -> "MLIROperator":
+        self.compilable = self.build_compilable()
+        self.compilable.compile()
+        return self
 
     def get_callable(self) -> Callable[..., Any]:
+        xclbin_path, insts_path = self.compilable.get_artifacts()
         npu_kernel = NPUKernel(
-            xclbin_path=self.xclbin_artifact.filename,
-            kernel_name=self.xclbin_artifact.kernel_name,
-            insts_path=self.insts_artifact.filename,
+            xclbin_path=str(xclbin_path),
+            kernel_name="MLIR_AIE",
+            insts_path=str(insts_path),
         )
         handle = aie_utils.DefaultNPURuntime.load(npu_kernel)
 

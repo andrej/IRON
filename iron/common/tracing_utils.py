@@ -39,8 +39,6 @@ import numpy as np
 
 from aie.utils.trace import parse_trace_slices, print_cycles_summary
 
-from . import compilation as comp
-
 __all__ = [
     "dump_traces",
     "parse_trace_buffer",
@@ -56,16 +54,14 @@ def lowered_mlir(run) -> tuple[Path, str]:
     mlir-aie's trace parser matches ``aiex.npu.write32`` ops against the trace unit's
     config addresses. ``aie-insert-trace-flows`` emits those writes inside aiecc, so
     the parser needs aiecc's lowered module. A traced build requests it with
-    ``--get-input-with-addresses``, which lands it in the work dir beside the source
-    (``<source>.mlir.d/``).
+    ``--get-input-with-addresses``, which lands it in the build's work dir.
     """
     override = os.environ.get("IRON_TRACE_MLIR")
     if override:
         path = Path(override)
         return path, path.read_text()
 
-    source = Path(run.op.artifacts[0].mlir_input.filename)
-    path = comp._aiecc_work_dir(str(source)) / "input_with_addresses.mlir"
+    path = run.op.work_dir / "input_with_addresses.mlir"
     if not path.exists():
         raise FileNotFoundError(
             f"{path} is missing; a traced build passes --get-input-with-addresses "

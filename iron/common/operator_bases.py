@@ -114,12 +114,12 @@ class ChanneledUnaryOperator(MLIROperator):
     def _kernel_link_file(self) -> str:
         """The file name that the MLIR Kernel declaration should link_with.
 
-        When auxiliary objects are required (e.g. lut_based_ops.o on aie2),
-        all objects are bundled into an archive and the archive name is
-        returned so that aiecc links the entire archive.
+        When auxiliary sources are required (e.g. lut_based_ops.cpp on aie2),
+        they compile into one object together with the kernel, so the combined
+        object's name is returned.
         """
         if self.needs_lut_ops and get_kernel_dir() == "aie2":
-            return f"{self.name}_kernels.a"
+            return f"{self.name}_kernels.o"
         return f"{self.kernel_name}.o"
 
     def get_mlir_artifact(self) -> PythonGeneratedMLIRArtifact:
@@ -155,7 +155,7 @@ class ChanneledUnaryOperator(MLIROperator):
             lut_objs = lut_based_ops_artifacts(kernel_dir)
             return [
                 KernelArchiveArtifact(
-                    f"{self.name}_kernels.a",
+                    f"{self.name}_kernels.o",
                     dependencies=[kernel_obj] + lut_objs,
                 )
             ]

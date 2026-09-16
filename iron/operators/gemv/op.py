@@ -79,10 +79,10 @@ class GEMV(MLIROperator):
 
     @property
     def _kernel_link_file(self):
-        # With the gelu epilogue the core also links the gelu kernel, so the object becomes an
-        # archive of (matvec, gelu); the plain matvec stays a single object.
+        # With the gelu epilogue the core also links the gelu kernel, so both
+        # sources compile into one object; the plain matvec has only its own.
         if self.epilogue == "gelu":
-            return f"gemv_{self.K}k_{self.kernel_vector_size}vs_gelu_kernels.a"
+            return f"gemv_{self.K}k_{self.kernel_vector_size}vs_gelu_kernels.o"
         return f"gemv_{self.K}k_{self.kernel_vector_size}vs.o"
 
     def get_mlir_artifact(self):
