@@ -43,19 +43,14 @@ def lut_based_ops_artifacts(kernel_dir: str) -> list[KernelObjectArtifact]:
 class ChanneledUnaryOperator(MLIROperator):
     """Base class for channeled unary AIE operators (single input, single output).
 
-    Assumes a single kernel source file and a standard design.py callback
-    with args [device, size, num_aie_columns, num_channels, tile_size, trace_size].
+    Subclasses name the mlir-aie kernel factory that writes their compute kernel:
 
-    Subclasses must define ClassVar attributes:
-        kernel_name:   name of the kernel object file (e.g. "gelu" → gelu.o / gelu.cc)
-        callback_fn:   design.py callback function name (e.g. "my_gelu")
-        needs_lut_ops: set True for operators that require lut_based_ops.o on aie2
+        kernel_factory: attribute of ``aie.iron.kernels`` (e.g. "gelu_sized")
+        tile_cap:       largest tile the kernel takes, in elements
 
     Customization points:
-        - For operators with extra parameters (e.g. alpha, trace_size), add
-          dataclass fields and override _mlir_callback_args().
-        - For operators requiring multiple kernels, extra compile flags, or
-          external source files, override get_kernel_artifacts() directly.
+        - For operators with extra parameters (e.g. alpha), add dataclass fields
+          and override _design_kwargs().
         - For non-standard arg specs, override get_arg_spec() directly.
         - If none of these fit, subclass MLIROperator instead.
     """

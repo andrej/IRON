@@ -29,6 +29,7 @@ def channeled_unary_design(
     trace_size: CompileTime[int],
     kernel: CompileTime[str],
     tile_cap: CompileTime[int] = 4096,
+    kernel_args: CompileTime[tuple] = (),
 ):
     xfr_dtype = bfloat16
     line_size = tile_cap if tile_size > tile_cap else tile_size
@@ -70,7 +71,7 @@ def channeled_unary_design(
         for _ in range_(N_div_n):
             elem_in = of_in.acquire(1)
             elem_out = of_out.acquire(1)
-            kernel_line(elem_in, elem_out, line_size)
+            kernel_line(elem_in, elem_out, line_size, *kernel_args)
             of_in.release(1)
             of_out.release(1)
 
