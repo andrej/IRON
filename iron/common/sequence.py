@@ -113,7 +113,6 @@ class FusedDispatch(SequenceDispatch):
     def compile(self, seq):
         compilable = comp.build_compilable(
             self.build_fused_design(seq),
-            self._collect_kernel_artifacts(seq),
             use_chess=seq.context.compiler == "chess",
             full_elf=True,
             aiecc_flags=self._aiecc_flags(seq),
@@ -146,12 +145,9 @@ class FusedDispatch(SequenceDispatch):
         design_names = []
 
         for idx, op in enumerate(designs):
-            generator = op.get_mlir_artifact().generator
-            if len(op.get_kernel_artifacts()) > 0:
-                generator.kwargs["func_prefix"] = f"op{idx}_"
             op_name = f"op{idx}_{op.__class__.__name__}"
             design_names.append(op_name)
-            designs_by_name[op_name] = generator
+            designs_by_name[op_name] = self._child_design(op, idx)
 
         for op, *bufs in seq.runlist:
             comp_runlist.append((design_names[design_of[id(op)]], *bufs))
@@ -164,16 +160,27 @@ class FusedDispatch(SequenceDispatch):
             slice_info=seq.slice_info,
         )
 
-    def _collect_kernel_artifacts(self, seq):
-        """Kernel artifacts from all child operators, prefixed per operator index."""
-        kernel_artifacts = []
-        for idx, op in enumerate(seq.unique_designs()[0]):
-            objs = op.get_kernel_artifacts()
-            for obj in objs:
-                obj.filename = f"op{idx}_{obj.filename}"
-                obj.symbol_prefix = f"op{idx}_"
-            kernel_artifacts.extend(objs)
-        return kernel_artifacts
+    @staticmethod
+    def _child_design(op, idx):
+        """One operator's design, with its symbols moved out of the others' way.
+
+        Two operators built from one source would otherwise write the same
+        object and export the same entry points into the fused ELF.
+        """
+        artifact = op.get_mlir_artifact()
+        if artifact is None:
+            return op.build_compilable()
+        kernels = op.get_kernel_artifacts()
+        if kernels:
+            artifact.generator.kwargs["func_prefix"] = f"op{idx}_"
+        for kernel in kernels:
+            kernel.filename = f"op{idx}_{kernel.filename}"
+            kernel.symbol_prefix = f"op{idx}_"
+        return comp.build_compilable(
+            artifact.generator,
+            kernels,
+            use_chess=op.context.compiler == "chess",
+        )
 
     def make_callable(self, seq):
         return SequenceFullELFCallable(seq)

@@ -12,13 +12,11 @@ from dataclasses import dataclass, field
 from aie import ir
 from aie.dialects import aie, aiex, memref
 from aie.extras.context import mlir_mod_ctx
-from aie.utils.compile.jit.context import compile_context
+from aie.utils.compile.jit.compilabledesign import CompilableDesign
 from aie.utils.trace import get_trace_slices
 import ml_dtypes
 
 from typing import Any
-
-from .base import DesignGenerator, stable_repr
 
 RESET_DEVICE = "reset_device"
 
@@ -38,11 +36,11 @@ def trace_buffer_size(mlir_text: str) -> int:
 class SequenceDesign:
     """Inlines each operator's design into one module that dispatches them in turn.
 
-    Takes the place of a single operator's :class:`DesignGenerator`: calling it
-    returns the fused MLIR module.
+    Calling it returns the fused MLIR module. mlir-aie reads the key of every
+    design in ``designs`` into the key of the build this design describes.
     """
 
-    designs: dict[str, DesignGenerator]
+    designs: dict[str, CompilableDesign]
     runlist: list[tuple[str, ...]]
     subbuffer_layout: dict[str, tuple[str, int, int]]
     buffer_sizes: tuple[int, int, int]
@@ -51,16 +49,11 @@ class SequenceDesign:
     def __call__(self):
         return ir.Module.parse(fuse_mlir(self))
 
-    def __repr__(self) -> str:
-        return (
-            f"SequenceDesign({stable_repr(self.designs)}, "
-            f"{stable_repr(self.runlist)}, {stable_repr(self.subbuffer_layout)}, "
-            f"{stable_repr(self.buffer_sizes)}, {stable_repr(self.slice_info)})"
-        )
-
     @property
     def source_paths(self):
-        return [path for gen in self.designs.values() for path in gen.source_paths]
+        return [
+            path for design in self.designs.values() for path in design.source_files
+        ]
 
 
 # Helper Functions
@@ -121,12 +114,15 @@ def fuse_mlir(design: SequenceDesign) -> str:
     operator_param_decls: dict[str, dict[str, ir.Type]] = {}
     device_ty = None
     sequence_arg_types = {}
-    for op_name, generator in design.designs.items():
+    for op_name, child in design.designs.items():
         # The fused sequence configures each design itself, so a design must not
         # also load its own PDI. Generating it under the full-ELF flag would add
         # that load to its runtime sequence.
-        with compile_context(_iron_full_elf=False):
-            mlir_module = generator()
+        mlir_text = child.inline(full_elf=False)
+        # Each design parses into a context of its own, as it generated into one.
+        # The types read out below keep that context alive.
+        with mlir_mod_ctx():
+            mlir_module = ir.Module.parse(mlir_text)
         device_ops = []
         params_here: dict[str, ir.Type] = {}
         for op in mlir_module.body.operations:
