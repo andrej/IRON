@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 from iron.common import BinaryElementwiseOperator
-from iron.common.device_utils import kernel_source
 
 from iron.operators.axpy.design import my_axpy
 
@@ -16,8 +15,7 @@ class AXPY(BinaryElementwiseOperator):
 
     scalar_factor: float = 3.0
 
-    kernel_name: ClassVar[str] = "axpy"
-    kernel_fn_name: ClassVar[str] = "saxpy"
+    kernel_factory: ClassVar[str] = "axpy"
 
     def get_design(self):
         return my_axpy
@@ -30,6 +28,3 @@ class AXPY(BinaryElementwiseOperator):
             "trace_size": 0,
             "scalar_factor": self.scalar_factor,
         }
-
-    def kernel_sources(self):
-        return [kernel_source("axpy", "generic")]
