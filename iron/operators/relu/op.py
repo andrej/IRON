@@ -11,9 +11,7 @@ from iron.common import ChanneledUnaryOperator
 class ReLU(ChanneledUnaryOperator):
     """AIE-accelerated ReLU activation function"""
 
-    kernel_name: ClassVar[str] = "relu"
-    kernel_fn_name: ClassVar[str] = "relu_bf16_size"
-    callback_fn: ClassVar[str] = "my_relu"
+    kernel_factory: ClassVar[str] = "relu_sized"
 
     def reference(self, x):
         from iron.operators.relu.reference import reference

@@ -132,22 +132,41 @@ class MLIROperator(AIEOperatorBase):
         dev = aie_utils.get_current_device()
         return f"{base}_{dev.resolve().name}"
 
-    @abstractmethod
-    def get_mlir_artifact(self) -> PythonGeneratedMLIRArtifact:
-        pass
+    def get_mlir_artifact(self) -> PythonGeneratedMLIRArtifact | None:
+        """The artifact-path design, for operators not yet on ``get_design``."""
+        return None
 
-    @abstractmethod
     def get_kernel_artifacts(self) -> list:
-        pass
+        """The artifact-path kernels, for operators not yet on ``get_design``."""
+        return []
+
+    def get_design(self):
+        """The ``@iron.jit`` design this operator builds.
+
+        ``None`` selects the artifact path, which the unported operators still
+        take.
+        """
+        return None
+
+    def get_design_kwargs(self) -> dict[str, Any]:
+        """The ``CompileTime`` values to build the design with."""
+        return {}
 
     def build_compilable(self, *, full_elf: bool = False, aiecc_flags=()):
-        return build_compilable(
-            self.get_mlir_artifact().generator,
-            self.get_kernel_artifacts(),
-            use_chess=self.context.compiler == "chess",
+        design = self.get_design()
+        if design is None:
+            return build_compilable(
+                self.get_mlir_artifact().generator,
+                self.get_kernel_artifacts(),
+                use_chess=self.context.compiler == "chess",
+                full_elf=full_elf,
+                aiecc_flags=aiecc_flags,
+            )
+        return design.specialize(
+            aiecc_flags=list(aiecc_flags),
             full_elf=full_elf,
-            aiecc_flags=aiecc_flags,
-        )
+            **self.get_design_kwargs(),
+        ).compilable
 
     def compile(self) -> "MLIROperator":
         self.compilable = self.build_compilable()

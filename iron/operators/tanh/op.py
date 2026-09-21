@@ -11,7 +11,4 @@ from iron.common import ChanneledUnaryOperator
 class Tanh(ChanneledUnaryOperator):
     """AIE-accelerated Tanh activation function"""
 
-    kernel_name: ClassVar[str] = "tanh"
-    kernel_fn_name: ClassVar[str] = "tanh_bf16"
-    needs_lut_ops: ClassVar[bool] = True
-    callback_fn: ClassVar[str] = "my_tanh"
+    kernel_factory: ClassVar[str] = "tanh"

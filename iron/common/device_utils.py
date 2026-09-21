@@ -10,3 +10,14 @@ def get_kernel_dir(dev=None) -> str:
     if dev is None:
         dev = aie_utils.get_current_device()
     return resolve_target_arch(dev)
+
+
+def kernel_source(name: str, subdir: str | None = None):
+    """The C++ source for kernel ``name``, in the active device's directory.
+
+    Both the design that compiles the kernel and the operator that feeds the
+    cache key resolve the path through here, so the two cannot disagree.
+    """
+    from .context import AIEContext
+
+    return AIEContext().kernels_dir / (subdir or get_kernel_dir()) / f"{name}.cc"

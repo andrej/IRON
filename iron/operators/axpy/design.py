@@ -4,19 +4,25 @@
 from ml_dtypes import bfloat16
 import numpy as np
 
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
+import aie.iron as iron
+from aie.iron import CompileTime, ObjectFifo, Program, Runtime, TaskGroup, Worker
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
+from iron.common.device_utils import kernel_source
+from iron.common.kernels import kernel_object
 from iron.operators._trace import maybe_enable_trace
 
 
+@iron.jit
 def my_axpy(
-    dev,
-    num_elements,
-    num_columns,
-    tile_size,
-    trace_size,
-    scalar_factor,
+    *,
+    num_elements: CompileTime[int],
+    num_columns: CompileTime[int],
+    tile_size: CompileTime[int],
+    trace_size: CompileTime[int],
+    scalar_factor: CompileTime[float],
+    prefix: CompileTime[str] = "",
+    use_chess: CompileTime[bool] = False,
 ):
     factor = scalar_factor
     per_tile_elements = 4096 if tile_size > 4096 else tile_size
@@ -39,9 +45,13 @@ def my_axpy(
     of_outs = [ObjectFifo(tile_ty, name=f"out_{i}") for i in range(num_columns)]
 
     # AIE Core Function declaration
-    axpy_bf16_vector = Kernel(
-        "saxpy", "axpy.o", [tile_ty, tile_ty, np.float32, tile_ty, np.int32]
-    )
+    axpy_bf16_vector = kernel_object(
+        [kernel_source("axpy", "generic")],
+        {"saxpy": [tile_ty, tile_ty, np.float32, tile_ty, np.int32]},
+        object_name=f"{prefix}_axpy.o" if prefix else "axpy.o",
+        prefix=prefix,
+        use_chess=use_chess,
+    )["saxpy"]
 
     # Define a task that will run on a compute tile
     def core_body(of_in1, of_in2, of_out, axpy):
@@ -123,6 +133,6 @@ def my_axpy(
     )
 
     # Place program components (assign them resources on the device) and generate an MLIR module
-    prog = Program(dev, rt, workers=my_workers)
+    prog = Program(iron.get_current_device(), rt, workers=my_workers)
     maybe_enable_trace(prog, trace_size, my_workers)
     return prog.resolve_program()

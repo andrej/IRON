@@ -66,10 +66,7 @@ class ChanneledUnaryOperator(MLIROperator):
     tile_size: int
     context: AIEContext | None = field(default=None, repr=False)
 
-    kernel_name: ClassVar[str]
-    kernel_fn_name: ClassVar[str]
-    callback_fn: ClassVar[str]
-    needs_lut_ops: ClassVar[bool] = False
+    kernel_factory: ClassVar[str]
     tile_cap: ClassVar[int] = 4096
 
     def __post_init__(self) -> None:
@@ -95,68 +92,27 @@ class ChanneledUnaryOperator(MLIROperator):
             AIERuntimeArgSpec("out", (self.size,)),
         ]
 
-    def _mlir_callback_args(self) -> list[Any]:
-        """Return the callback_args list for PythonGeneratedMLIRArtifact.
+    def _design_kwargs(self) -> dict[str, Any]:
+        """Subclasses with extra parameters (e.g. alpha) add them here."""
+        return {
+            "size": self.size,
+            "num_columns": self.num_aie_columns,
+            "num_channels": self.num_channels,
+            "tile_size": self.tile_size,
+            "trace_size": 0,
+        }
 
-        Subclasses with extra parameters (e.g. alpha, trace_size) should
-        override this method.
-        """
-        return [
-            aie_utils.get_current_device(),
-            self.size,
-            self.num_aie_columns,
-            self.num_channels,
-            self.tile_size,
-            0,
-        ]
+    def get_design(self):
+        from iron.operators.channeled_unary_design import channeled_unary_design
 
-    @property
-    def _kernel_link_file(self) -> str:
-        """The file name that the MLIR Kernel declaration should link_with.
+        return channeled_unary_design
 
-        When auxiliary sources are required (e.g. lut_based_ops.cpp on aie2),
-        they compile into one object together with the kernel, so the combined
-        object's name is returned.
-        """
-        if self.needs_lut_ops and get_kernel_dir() == "aie2":
-            return f"{self.name}_kernels.o"
-        return f"{self.kernel_name}.o"
-
-    def get_mlir_artifact(self) -> PythonGeneratedMLIRArtifact:
-        callback_args = self._mlir_callback_args() + [
-            self.kernel_fn_name,
-            self._kernel_link_file,
-            self.tile_cap,
-        ]
-        return PythonGeneratedMLIRArtifact(
-            f"{self.name}.mlir",
-            DesignGenerator(
-                self.operator_dir.parent / "channeled_unary_design.py",
-                "channeled_unary_design",
-                tuple(callback_args),
-            ),
-        )
-
-    def get_kernel_artifacts(self) -> list:
-        dev = aie_utils.get_current_device()
-        kernel_dir = get_kernel_dir(dev)
-        kernel_obj = KernelObjectArtifact(
-            f"{self.kernel_name}.o",
-            dependencies=[
-                SourceArtifact(
-                    self.context.kernels_dir / kernel_dir / f"{self.kernel_name}.cc"
-                )
-            ],
-        )
-        if self.needs_lut_ops and kernel_dir == "aie2":
-            lut_objs = lut_based_ops_artifacts(kernel_dir)
-            return [
-                KernelArchiveArtifact(
-                    f"{self.name}_kernels.o",
-                    dependencies=[kernel_obj] + lut_objs,
-                )
-            ]
-        return [kernel_obj]
+    def get_design_kwargs(self) -> dict[str, Any]:
+        return {
+            **self._design_kwargs(),
+            "kernel": self.kernel_factory,
+            "tile_cap": self.tile_cap,
+        }
 
 
 @dataclass

@@ -4,23 +4,31 @@
 from ml_dtypes import bfloat16
 import numpy as np
 
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
+import aie.iron as iron
+from aie.iron import (
+    CompileTime,
+    ObjectFifo,
+    Program,
+    Runtime,
+    TaskGroup,
+    Worker,
+    kernels,
+)
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
 from iron.operators._trace import maybe_enable_trace
 
 
+@iron.jit
 def channeled_unary_design(
-    dev,
-    size,
-    num_columns,
-    num_channels,
-    tile_size,
-    trace_size,
-    kernel_fn_name,
-    kernel_obj_file,
-    tile_cap=4096,
-    func_prefix="",
+    *,
+    size: CompileTime[int],
+    num_columns: CompileTime[int],
+    num_channels: CompileTime[int],
+    tile_size: CompileTime[int],
+    trace_size: CompileTime[int],
+    kernel: CompileTime[str],
+    tile_cap: CompileTime[int] = 4096,
 ):
     xfr_dtype = bfloat16
     line_size = tile_cap if tile_size > tile_cap else tile_size
@@ -55,11 +63,7 @@ def channeled_unary_design(
     ]
 
     # External, binary kernel definition
-    kernel_fcn = Kernel(
-        f"{func_prefix}{kernel_fn_name}",
-        f"{func_prefix}{kernel_obj_file}",
-        [line_type, line_type, np.int32],
-    )
+    kernel_fcn = getattr(kernels, kernel)(tile_size=line_size)
 
     # Task for the core to perform
     def core_fn(of_in, of_out, kernel_line):
@@ -130,6 +134,6 @@ def channeled_unary_design(
     )
 
     # Place components and generate an MLIR module
-    prog = Program(dev, rt, workers=my_workers)
+    prog = Program(iron.get_current_device(), rt, workers=my_workers)
     maybe_enable_trace(prog, trace_size, my_workers)
     return prog.resolve_program()

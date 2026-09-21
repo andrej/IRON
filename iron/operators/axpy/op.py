@@ -4,13 +4,10 @@
 from dataclasses import dataclass
 from typing import ClassVar
 
-from iron.common import (
-    BinaryElementwiseOperator,
-    KernelObjectArtifact,
-    SourceArtifact,
-    PythonGeneratedMLIRArtifact,
-    DesignGenerator,
-)
+from iron.common import BinaryElementwiseOperator
+from iron.common.device_utils import kernel_source
+
+from iron.operators.axpy.design import my_axpy
 
 
 @dataclass
@@ -21,28 +18,18 @@ class AXPY(BinaryElementwiseOperator):
 
     kernel_name: ClassVar[str] = "axpy"
     kernel_fn_name: ClassVar[str] = "saxpy"
-    callback_fn: ClassVar[str] = "my_axpy"
 
-    def get_kernel_artifacts(self) -> list[KernelObjectArtifact]:
-        # axpy.cc lives under aie_kernels/generic/ (not device-specific)
-        return [
-            KernelObjectArtifact(
-                "axpy.o",
-                dependencies=[
-                    SourceArtifact(self.context.kernels_dir / "generic" / "axpy.cc")
-                ],
-            )
-        ]
+    def get_design(self):
+        return my_axpy
 
-    def _mlir_callback_args(self):
-        return super()._mlir_callback_args() + [self.scalar_factor]
+    def get_design_kwargs(self):
+        return {
+            "num_elements": self.size,
+            "num_columns": self.num_aie_columns,
+            "tile_size": self.tile_size,
+            "trace_size": 0,
+            "scalar_factor": self.scalar_factor,
+        }
 
-    def get_mlir_artifact(self) -> PythonGeneratedMLIRArtifact:
-        return PythonGeneratedMLIRArtifact(
-            f"{self.name}.mlir",
-            DesignGenerator(
-                self.operator_dir / "design.py",
-                self.callback_fn,
-                tuple(self._mlir_callback_args()),
-            ),
-        )
+    def kernel_sources(self):
+        return [kernel_source("axpy", "generic")]
