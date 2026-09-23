@@ -2,17 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass, field
-from typing import ClassVar, Dict
+from typing import Any, ClassVar, Dict
 
 from iron.common import (
     MLIROperator,
     AIERuntimeArgSpec,
-    KernelObjectArtifact,
-    SourceArtifact,
-    PythonGeneratedMLIRArtifact,
-    DesignGenerator,
 )
-import aie.utils as aie_utils
 
 
 @dataclass
@@ -53,33 +48,20 @@ class RoPE(MLIROperator):
 
         MLIROperator.__init__(self, context=self.context)
 
-    def get_mlir_artifact(self):
-        return PythonGeneratedMLIRArtifact(
-            f"{self.name}.mlir",
-            DesignGenerator(
-                self.operator_dir / "design.py",
-                "rope",
-                (
-                    aie_utils.get_current_device(),
-                    self.rows,
-                    self.cols,
-                    self.angle_rows,
-                    self.num_aie_columns,
-                    0,
-                    self.method_type,
-                ),
-            ),
-        )
+    def get_design(self):
+        from iron.operators.rope.design import rope
 
-    def get_kernel_artifacts(self):
-        return [
-            KernelObjectArtifact(
-                f"rope_{self.method_type}.o",
-                dependencies=[
-                    SourceArtifact(self.context.kernels_dir / "generic" / "rope.cc")
-                ],
-            ),
-        ]
+        return rope
+
+    def get_design_kwargs(self) -> dict[str, Any]:
+        return {
+            "rows": self.rows,
+            "cols": self.cols,
+            "angle_rows": self.angle_rows,
+            "num_aie_columns": self.num_aie_columns,
+            "trace_size": 0,
+            "method_type": self.method_type,
+        }
 
     def get_arg_spec(self):
         return [

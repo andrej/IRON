@@ -2,19 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass, field
+from typing import Any
 
-import aie.utils as aie_utils
-
-from iron.common.device_utils import get_kernel_dir
-from iron.common.operator_bases import lut_based_ops_artifacts
 from iron.common import (
     MLIROperator,
     AIERuntimeArgSpec,
-    KernelArchiveArtifact,
-    KernelObjectArtifact,
-    SourceArtifact,
-    PythonGeneratedMLIRArtifact,
-    DesignGenerator,
 )
 
 
@@ -45,51 +37,21 @@ class Softmax(MLIROperator):
             )
         MLIROperator.__init__(self, context=self.context)
 
-    @property
-    def _kernel_link_file(self):
-        kernel_dir = get_kernel_dir()
-        if kernel_dir == "aie2":
-            return f"{self.name}_kernels.a"
-        return "softmax.o"
+    def get_design(self):
+        from iron.operators.softmax.design import softmax
 
-    def get_mlir_artifact(self):
-        return PythonGeneratedMLIRArtifact(
-            f"{self.name}.mlir",
-            DesignGenerator(
-                self.operator_dir / "design.py",
-                "softmax",
-                (),
-                {
-                    "dev": aie_utils.get_current_device(),
-                    "num_elements": self.size,
-                    "num_aie_columns": self.num_aie_columns,
-                    "num_channels": self.num_channels,
-                    "trace_size": 0,
-                    "tile_size": self.cols,
-                    "rtp_vector_size": self.rtp_vector_size,
-                    "vector_size_parameter": self.vector_size_parameter,
-                    "kernel_obj_file": self._kernel_link_file,
-                },
-            ),
-        )
+        return softmax
 
-    def get_kernel_artifacts(self):
-        kernel_dir = get_kernel_dir()
-        softmax_obj = KernelObjectArtifact(
-            "softmax.o",
-            dependencies=[
-                SourceArtifact(self.context.kernels_dir / kernel_dir / "softmax.cc")
-            ],
-        )
-        lut_objs = lut_based_ops_artifacts(kernel_dir)
-        if lut_objs:
-            return [
-                KernelArchiveArtifact(
-                    f"{self.name}_kernels.a",
-                    dependencies=[softmax_obj] + lut_objs,
-                )
-            ]
-        return [softmax_obj]
+    def get_design_kwargs(self) -> dict[str, Any]:
+        return {
+            "num_elements": self.size,
+            "num_aie_columns": self.num_aie_columns,
+            "num_channels": self.num_channels,
+            "trace_size": 0,
+            "tile_size": self.cols,
+            "rtp_vector_size": self.rtp_vector_size,
+            "vector_size_parameter": self.vector_size_parameter,
+        }
 
     def get_arg_spec(self):
         return [

@@ -17,33 +17,36 @@ Another interpretation of the input tensor is (rows / num_heads, num_heads, cols
 
 import numpy as np
 
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
-from aie.iron.device import NPU1, NPU2
+import aie.iron as iron
+from aie.iron import (
+    CompileTime,
+    ObjectFifo,
+    Program,
+    Runtime,
+    TaskGroup,
+    Worker,
+    kernels,
+)
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.helpers.dialects.scf import _for as range_
 from ml_dtypes import bfloat16
 from iron.operators._trace import maybe_enable_trace
 
 
+@iron.jit
 def rope(
-    dev,
-    rows,
-    cols,
-    angle_rows=None,
-    num_aie_columns=1,
-    trace_size=0,
-    method_type=None,
-    func_prefix="",
+    *,
+    rows: CompileTime[int],
+    cols: CompileTime[int],
+    angle_rows: CompileTime[int] = None,
+    num_aie_columns: CompileTime[int] = 1,
+    trace_size: CompileTime[int] = 0,
+    method_type: CompileTime[int] = None,
 ):
     dtype = bfloat16
 
     if angle_rows is None:
         angle_rows = rows
-    kernel_object = (
-        f"{func_prefix}rope"
-        + (f"_{method_type}" if method_type is not None else "")
-        + ".o"
-    )
 
     assert cols % (16 * 2) == 0 and cols >= (
         16 * 2
@@ -75,12 +78,7 @@ def rope(
 
     # AIE Core Function declaration. method_type 0 = two-halves (HF), 1 =
     # interleaved/Llama (the "rope" symbol).
-    rope_symbol = "rope_two_halves" if method_type == 0 else "rope"
-    rope_kernel = Kernel(
-        f"{func_prefix}{rope_symbol}",
-        kernel_object,
-        [tensor_tile_ty, angle_tile_ty, tensor_tile_ty, np.int32],
-    )
+    rope_kernel = kernels.rope(tile_size=cols, two_halves=method_type == 0)
 
     # Define a task that will run on a compute tile
     def core_body(of_in, of_lut, of_out, rope_kernel):
@@ -169,6 +167,6 @@ def rope(
         ],
     )
     # Place program components (assign them resources on the device) and generate an MLIR module
-    prog = Program(dev, rt, workers=my_workers)
+    prog = Program(iron.get_current_device(), rt, workers=my_workers)
     maybe_enable_trace(prog, trace_size, my_workers)
     return prog.resolve_program()

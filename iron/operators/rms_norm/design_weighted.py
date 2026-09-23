@@ -4,21 +4,29 @@
 from ml_dtypes import bfloat16
 import numpy as np
 
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
-from aie.iron.device import NPU1, NPU2
+import aie.iron as iron
+from aie.iron import (
+    CompileTime,
+    ObjectFifo,
+    Program,
+    Runtime,
+    TaskGroup,
+    Worker,
+    kernels,
+)
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
 
 
+@iron.jit
 def my_weighted_rms_norm(
-    dev,
-    num_elements,
-    num_columns,
-    num_channels,
-    weight_length,
-    trace_size,
-    epsilon=1e-5,
-    func_prefix="",
+    *,
+    num_elements: CompileTime[int],
+    num_columns: CompileTime[int],
+    num_channels: CompileTime[int],
+    weight_length: CompileTime[int],
+    trace_size: CompileTime[int],
+    epsilon: CompileTime[float] = 1e-5,
 ):
     per_tile_elements = weight_length
     total_cores = num_columns * num_channels
@@ -61,16 +69,8 @@ def my_weighted_rms_norm(
     ]
 
     # AIE Core Function declaration
-    rms_norm_kernel = Kernel(
-        f"{func_prefix}rms_norm_eps",
-        f"{func_prefix}rms_norm.o",
-        [tile_ty, tile_ty, np.int32, np.float32],
-    )
-    eltwise_mul_kernel = Kernel(
-        f"{func_prefix}eltwise_mul_bf16_vector_size",
-        f"{func_prefix}mul.o",
-        [tile_ty, weights_ty, tile_ty, np.int32],
-    )
+    rms_norm_kernel = kernels.rms_norm_eps(tile_size=per_tile_elements)
+    eltwise_mul_kernel = kernels.mul_sized(tile_size=per_tile_elements)
 
     # Define a task that will run on a compute tile
     def core_body_norm(of_in1, of_out1, rms_norm):
@@ -184,4 +184,4 @@ def my_weighted_rms_norm(
         ],
     )
     # Place program components (assign them resources on the device) and generate an MLIR module
-    return Program(dev, rt, workers=my_workers).resolve_program()
+    return Program(iron.get_current_device(), rt, workers=my_workers).resolve_program()

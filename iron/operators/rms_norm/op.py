@@ -2,18 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass, field
-from typing import ClassVar, Dict
+from typing import Any, ClassVar, Dict
 
 from iron.common import (
     MLIROperator,
     AIERuntimeArgSpec,
-    KernelObjectArtifact,
-    SourceArtifact,
-    PythonGeneratedMLIRArtifact,
-    DesignGenerator,
 )
 import aie.utils as aie_utils
-from iron.common.device_utils import get_kernel_dir
 from iron.common.utils import get_shim_dma_limit
 
 
@@ -68,51 +63,29 @@ class RMSNorm(MLIROperator):
             )
         MLIROperator.__init__(self, context=self.context)
 
-    def get_mlir_artifact(self):
+    def get_design(self):
         if self.weighted:
-            source_path = self.operator_dir / "design_weighted.py"
-            callback_fn = "my_weighted_rms_norm"
-        else:
-            source_path = self.operator_dir / "design.py"
-            callback_fn = "my_rms_norm"
+            from iron.operators.rms_norm.design_weighted import my_weighted_rms_norm
 
-        return PythonGeneratedMLIRArtifact(
-            f"{self.name}.mlir",
-            DesignGenerator(
-                source_path,
-                callback_fn,
-                (
-                    aie_utils.get_current_device(),
-                    self.size,
-                    self.num_aie_columns,
-                    self.num_channels,
-                    self.tile_size,
-                    0,  # trace_size
-                    self.epsilon,
-                ),
-            ),
+            return my_weighted_rms_norm
+        from iron.operators.rms_norm.design import my_rms_norm
+
+        return my_rms_norm
+
+    def get_design_kwargs(self) -> dict[str, Any]:
+        sized = (
+            {"weight_length": self.tile_size}
+            if self.weighted
+            else {"tile_size": self.tile_size}
         )
-
-    def get_kernel_artifacts(self):
-        arch_dir = get_kernel_dir()
-        artifacts = [
-            KernelObjectArtifact(
-                "rms_norm.o",
-                dependencies=[
-                    SourceArtifact(self.context.kernels_dir / arch_dir / "rms_norm.cc")
-                ],
-            ),
-        ]
-        if self.weighted:
-            artifacts.append(
-                KernelObjectArtifact(
-                    "mul.o",
-                    dependencies=[
-                        SourceArtifact(self.context.kernels_dir / arch_dir / "mul.cc")
-                    ],
-                )
-            )
-        return artifacts
+        return {
+            "num_elements": self.size,
+            "num_columns": self.num_aie_columns,
+            "num_channels": self.num_channels,
+            **sized,
+            "trace_size": 0,
+            "epsilon": self.epsilon,
+        }
 
     def get_arg_spec(self):
         specs = [AIERuntimeArgSpec("in", (self.size // self.tile_size, self.tile_size))]

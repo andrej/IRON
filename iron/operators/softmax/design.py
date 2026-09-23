@@ -4,8 +4,9 @@
 
 import numpy as np
 
+import aie.iron as iron
 from aie.iron import (
-    Kernel,
+    CompileTime,
     ObjectFifo,
     ScratchpadParameter,
     Program,
@@ -14,26 +15,25 @@ from aie.iron import (
     Worker,
     Buffer,
     WorkerRuntimeBarrier,
+    kernels,
     sync_parameters,
 )
-from aie.iron.device import NPU1, NPU2
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.helpers.dialects.scf import _for as range_
 from ml_dtypes import bfloat16
 from iron.operators._trace import maybe_enable_trace
 
 
+@iron.jit
 def softmax(
-    dev,
-    num_elements,
-    num_aie_columns,
-    num_channels,
-    trace_size,
-    tile_size,
-    rtp_vector_size=None,
-    vector_size_parameter=None,
-    func_prefix="",
-    kernel_obj_file="softmax.o",
+    *,
+    num_elements: CompileTime[int],
+    num_aie_columns: CompileTime[int],
+    num_channels: CompileTime[int],
+    trace_size: CompileTime[int],
+    tile_size: CompileTime[int],
+    rtp_vector_size: CompileTime[int] = None,
+    vector_size_parameter: CompileTime[str] = None,
 ):
     per_tile_elements = tile_size
     if rtp_vector_size is None:
@@ -65,16 +65,8 @@ def softmax(
     ]
 
     # AIE Core Function declaration
-    softmax_kernel = Kernel(
-        f"{func_prefix}softmax_bf16",
-        f"{func_prefix}{kernel_obj_file}",
-        [tile_ty, tile_ty, np.int32],
-    )
-    mask_kernel = Kernel(
-        f"{func_prefix}mask_bf16",
-        f"{func_prefix}{kernel_obj_file}",
-        [tile_ty, np.int32, np.int32],
-    )
+    softmax_kernel = kernels.softmax(tile_size=per_tile_elements)
+    mask_kernel = softmax_kernel.mask
 
     # Vector size source: either a scratchpad Parameter (synced from host each
     # dispatch) or a write-RTP buffer set via rt.inline_ops at compile time.
@@ -206,6 +198,6 @@ def softmax(
     )
 
     # Place program components (assign them resources on the device) and generate an MLIR module
-    prog = Program(dev, rt, workers=my_workers)
+    prog = Program(iron.get_current_device(), rt, workers=my_workers)
     maybe_enable_trace(prog, trace_size, my_workers)
     return prog.resolve_program()

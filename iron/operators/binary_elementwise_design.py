@@ -4,21 +4,29 @@
 from ml_dtypes import bfloat16
 import numpy as np
 
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
+import aie.iron as iron
+from aie.iron import (
+    CompileTime,
+    ObjectFifo,
+    Program,
+    Runtime,
+    TaskGroup,
+    Worker,
+    kernels,
+)
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
 from iron.operators._trace import maybe_enable_trace
 
 
+@iron.jit
 def binary_elementwise_design(
-    dev,
-    num_elements,
-    num_columns,
-    tile_size,
-    trace_size,
-    kernel_fn_name,
-    kernel_obj_file,
-    func_prefix="",
+    *,
+    num_elements: CompileTime[int],
+    num_columns: CompileTime[int],
+    tile_size: CompileTime[int],
+    trace_size: CompileTime[int],
+    kernel: CompileTime[str],
 ):
     per_tile_elements = 4096 if tile_size > 4096 else tile_size
     n = per_tile_elements * num_columns
@@ -40,11 +48,7 @@ def binary_elementwise_design(
     of_outs = [ObjectFifo(tile_ty, name=f"out_{i}") for i in range(num_columns)]
 
     # AIE Core Function declaration
-    eltwise_kernel = Kernel(
-        f"{func_prefix}{kernel_fn_name}",
-        f"{func_prefix}{kernel_obj_file}",
-        [tile_ty, tile_ty, tile_ty, np.int32],
-    )
+    eltwise_kernel = getattr(kernels, kernel)(tile_size=per_tile_elements)
 
     # Define a task that will run on a compute tile
     def core_body(of_in1, of_in2, of_out, eltwise_fn):
@@ -121,6 +125,6 @@ def binary_elementwise_design(
     )
 
     # Place program components and generate an MLIR module
-    prog = Program(dev, rt, workers=my_workers)
+    prog = Program(iron.get_current_device(), rt, workers=my_workers)
     maybe_enable_trace(prog, trace_size, my_workers)
     return prog.resolve_program()

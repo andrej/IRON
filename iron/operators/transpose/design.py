@@ -4,13 +4,31 @@
 from ml_dtypes import bfloat16
 import numpy as np
 
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
+import aie.iron as iron
+from aie.iron import (
+    CompileTime,
+    ObjectFifo,
+    Program,
+    Runtime,
+    TaskGroup,
+    Worker,
+    kernels,
+)
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
 
 
+@iron.jit
 def shuffle_transpose(
-    dev, M, N, num_columns, num_channels, m, n, s, num_batches=1, func_prefix=""
+    *,
+    M: CompileTime[int],
+    N: CompileTime[int],
+    num_columns: CompileTime[int],
+    num_channels: CompileTime[int],
+    m: CompileTime[int],
+    n: CompileTime[int],
+    s: CompileTime[int],
+    num_batches: CompileTime[int] = 1,
 ):
     num_elements = M * N
     per_tile_elements = m * n
@@ -117,11 +135,7 @@ def shuffle_transpose(
     ]
 
     # AIE Core Function declaration
-    transpose_kernel = Kernel(
-        f"{func_prefix}transpose_{s}x{s}",
-        f"{func_prefix}transpose_{m}x{n}.o",
-        [tile_ty, tile_ty],
-    )
+    transpose_kernel = kernels.transpose(dim_m=m, dim_n=n, subtile=s)
 
     # Define a task that will run on a compute tile
     def core_body(of_in1, of_out, transpose_kernel):
@@ -189,4 +203,4 @@ def shuffle_transpose(
         ],
     )
     # Place program components (assign them resources on the device) and generate an MLIR module
-    return Program(dev, rt, workers=my_workers).resolve_program()
+    return Program(iron.get_current_device(), rt, workers=my_workers).resolve_program()

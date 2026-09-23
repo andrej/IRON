@@ -2,16 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass, field
-from typing import ClassVar, Dict
+from typing import Any, ClassVar, Dict
 
-import aie.utils as aie_utils
 from iron.common import (
     MLIROperator,
     AIERuntimeArgSpec,
-    KernelObjectArtifact,
-    SourceArtifact,
-    PythonGeneratedMLIRArtifact,
-    DesignGenerator,
 )
 
 
@@ -79,41 +74,22 @@ class Transpose(MLIROperator):
             )
         MLIROperator.__init__(self, context=self.context)
 
-    def get_mlir_artifact(self):
-        return PythonGeneratedMLIRArtifact(
-            f"{self.name}.mlir",
-            DesignGenerator(
-                self.operator_dir / "design.py",
-                "shuffle_transpose",
-                (
-                    aie_utils.get_current_device(),
-                    self.M,
-                    self.N,
-                    self.num_aie_columns,
-                    self.num_channels,
-                    self.m,
-                    self.n,
-                    self.s,
-                    self.num_batches,
-                ),
-            ),
-        )
+    def get_design(self):
+        from iron.operators.transpose.design import shuffle_transpose
 
-    def get_kernel_artifacts(self):
-        return [
-            KernelObjectArtifact(
-                f"transpose_{self.m}x{self.n}.o",
-                dependencies=[
-                    SourceArtifact(
-                        self.context.kernels_dir / "generic" / "transpose.cc"
-                    )
-                ],
-                extra_flags=[
-                    f"-DDIM_m={self.m}",
-                    f"-DDIM_n={self.n}",
-                ],
-            ),
-        ]
+        return shuffle_transpose
+
+    def get_design_kwargs(self) -> dict[str, Any]:
+        return {
+            "M": self.M,
+            "N": self.N,
+            "num_columns": self.num_aie_columns,
+            "num_channels": self.num_channels,
+            "m": self.m,
+            "n": self.n,
+            "s": self.s,
+            "num_batches": self.num_batches,
+        }
 
     def get_arg_spec(self):
         batch_dim = (self.num_batches,) if self.num_batches > 1 else ()

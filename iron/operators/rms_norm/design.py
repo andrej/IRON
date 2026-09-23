@@ -4,20 +4,29 @@
 from ml_dtypes import bfloat16
 import numpy as np
 
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
-from aie.iron.device import NPU1, NPU2
+import aie.iron as iron
+from aie.iron import (
+    CompileTime,
+    ObjectFifo,
+    Program,
+    Runtime,
+    TaskGroup,
+    Worker,
+    kernels,
+)
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
 
 
+@iron.jit
 def my_rms_norm(
-    dev,
-    num_elements,
-    num_columns,
-    num_channels,
-    tile_size,
-    trace_size,
-    epsilon=1e-5,
+    *,
+    num_elements: CompileTime[int],
+    num_columns: CompileTime[int],
+    num_channels: CompileTime[int],
+    tile_size: CompileTime[int],
+    trace_size: CompileTime[int],
+    epsilon: CompileTime[float] = 1e-5,
 ):
     per_tile_elements = 8192 if tile_size > 8192 else tile_size
     total_cores = num_columns * num_channels
@@ -49,9 +58,7 @@ def my_rms_norm(
     ]
 
     # AIE Core Function declaration
-    rms_norm_kernel = Kernel(
-        "rms_norm_eps", "rms_norm.o", [tile_ty, tile_ty, np.int32, np.float32]
-    )
+    rms_norm_kernel = kernels.rms_norm_eps(tile_size=per_tile_elements)
 
     # Define a task that will run on a compute tile
     def core_body(of_in1, of_out, rms_norm_kernel):
@@ -128,4 +135,4 @@ def my_rms_norm(
         ],
     )
     # Place program components (assign them resources on the device) and generate an MLIR module
-    return Program(dev, rt, workers=my_workers).resolve_program()
+    return Program(iron.get_current_device(), rt, workers=my_workers).resolve_program()

@@ -114,17 +114,12 @@ class ChanneledUnaryOperator(MLIROperator):
 class BinaryElementwiseOperator(MLIROperator):
     """Base class for binary element-wise AIE operators (two inputs, one output).
 
-    Assumes a single kernel source file and a standard design.py callback
-    with args [device, size, num_aie_columns, tile_size, trace_size].
-
     Unlike ChanneledUnaryOperator, binary operators have no explicit num_channels
     parameter — each core uses 2 DMA channels (one per input), so the ShimDMA
     limit is enforced as num_aie_columns * 2 <= 16.
 
-    Subclasses must define ClassVar attributes:
-        kernel_name:   name of the kernel object file (e.g. "add" → add.o / add.cc)
-        kernel_subdir: subdirectory under aie_kernels/ (e.g. "generic")
-        callback_fn:   design.py callback function name (e.g. "my_eltwise_add")
+    Subclasses name the mlir-aie kernel factory that writes their compute
+    kernel in ``kernel_factory`` (e.g. "add_sized").
     """
 
     size: int
@@ -132,10 +127,7 @@ class BinaryElementwiseOperator(MLIROperator):
     num_aie_columns: int = 8
     context: AIEContext | None = field(default=None, repr=False)
 
-    kernel_name: ClassVar[str]
-    kernel_fn_name: ClassVar[str]
-    kernel_subdir: ClassVar[str]
-    callback_fn: ClassVar[str]
+    kernel_factory: ClassVar[str]
     # Override parent's "c" alias with "col" so binary-elementwise operator names
     # are unambiguous when num_aie_columns and num_channels both appear in the
     # name (the parent ChanneledUnaryOperator uses "c" for num_aie_columns).
@@ -168,39 +160,19 @@ class BinaryElementwiseOperator(MLIROperator):
             AIERuntimeArgSpec("out", (self.size,)),
         ]
 
-    def _mlir_callback_args(self) -> list[Any]:
-        """Return the callback_args list for PythonGeneratedMLIRArtifact.
+    def _design_kwargs(self) -> dict[str, Any]:
+        """Subclasses with extra parameters (e.g. scalar_factor) add them here."""
+        return {
+            "num_elements": self.size,
+            "num_columns": self.num_aie_columns,
+            "tile_size": self.tile_size,
+            "trace_size": 0,
+        }
 
-        Subclasses with extra parameters (e.g. scalar_factor) should
-        override this method.
-        """
-        return [
-            aie_utils.get_current_device(),
-            self.size,
-            self.num_aie_columns,
-            self.tile_size,
-            0,
-        ]
+    def get_design(self):
+        from iron.operators.binary_elementwise_design import binary_elementwise_design
 
-    def get_mlir_artifact(self) -> PythonGeneratedMLIRArtifact:
-        callback_args = self._mlir_callback_args() + [
-            self.kernel_fn_name,
-            f"{self.kernel_name}.o",
-        ]
-        return PythonGeneratedMLIRArtifact(
-            f"{self.name}.mlir",
-            DesignGenerator(
-                self.operator_dir.parent / "binary_elementwise_design.py",
-                "binary_elementwise_design",
-                tuple(callback_args),
-            ),
-        )
+        return binary_elementwise_design
 
-    def get_kernel_artifacts(self) -> list[KernelObjectArtifact]:
-        source = self.context.kernels_dir / get_kernel_dir() / f"{self.kernel_name}.cc"
-        return [
-            KernelObjectArtifact(
-                f"{self.kernel_name}.o",
-                dependencies=[SourceArtifact(source)],
-            ),
-        ]
+    def get_design_kwargs(self) -> dict[str, Any]:
+        return {**self._design_kwargs(), "kernel": self.kernel_factory}
