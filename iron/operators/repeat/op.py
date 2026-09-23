@@ -2,16 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass, field
-from typing import ClassVar, Dict
+from typing import Any, ClassVar, Dict
 from ml_dtypes import bfloat16
 
 from iron.common import (
     MLIROperator,
     AIERuntimeArgSpec,
-    PythonGeneratedMLIRArtifact,
-    DesignGenerator,
 )
-import aie.utils as aie_utils
 
 
 @dataclass
@@ -34,25 +31,19 @@ class Repeat(MLIROperator):
     def __post_init__(self):
         MLIROperator.__init__(self, context=self.context)
 
-    def get_mlir_artifact(self):
-        return PythonGeneratedMLIRArtifact(
-            f"{self.name}.mlir",
-            DesignGenerator(
-                self.operator_dir / "design.py",
-                "repeat",
-                (
-                    aie_utils.get_current_device(),
-                    self.dtype,
-                    self.rows,
-                    self.cols,
-                    self.repeat,
-                    self.transfer_size,
-                ),
-            ),
-        )
+    def get_design(self):
+        from iron.operators.repeat.design import repeat
 
-    def get_kernel_artifacts(self):
-        return []
+        return repeat
+
+    def get_design_kwargs(self) -> dict[str, Any]:
+        return {
+            "dtype": self.dtype,
+            "rows": self.rows,
+            "cols": self.cols,
+            "repeat": self.repeat,
+            "transfer_size": self.transfer_size,
+        }
 
     def get_arg_spec(self):
         return [

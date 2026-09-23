@@ -2,17 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass, field
-from typing import ClassVar, Dict
+from typing import Any, ClassVar, Dict
 
 from iron.common import (
     MLIROperator,
     AIERuntimeArgSpec,
-    KernelObjectArtifact,
-    SourceArtifact,
-    PythonGeneratedMLIRArtifact,
-    DesignGenerator,
 )
-import aie.utils as aie_utils
 
 
 @dataclass
@@ -36,38 +31,20 @@ class MemCopy(MLIROperator):
     def __post_init__(self):
         MLIROperator.__init__(self, context=self.context)
 
-    def get_mlir_artifact(self):
-        return PythonGeneratedMLIRArtifact(
-            f"{self.name}.mlir",
-            DesignGenerator(
-                self.operator_dir / "design.py",
-                "my_mem_copy",
-                (
-                    aie_utils.get_current_device(),
-                    self.size,
-                    self.num_cores,
-                    self.num_channels,
-                    self.bypass,
-                    self.tile_size,
-                    0,
-                ),
-            ),
-        )
+    def get_design(self):
+        from iron.operators.mem_copy.design import my_mem_copy
 
-    def get_kernel_artifacts(self):
-        if self.bypass:
-            return []
-        return [
-            KernelObjectArtifact(
-                "mem_copy.o",
-                extra_flags=["-DBIT_WIDTH=16"],
-                dependencies=[
-                    SourceArtifact(
-                        self.context.kernels_dir / "generic" / "passThrough.cc"
-                    )
-                ],
-            )
-        ]
+        return my_mem_copy
+
+    def get_design_kwargs(self) -> dict[str, Any]:
+        return {
+            "size": self.size,
+            "num_cores": self.num_cores,
+            "num_channels": self.num_channels,
+            "bypass": self.bypass,
+            "tile_size": self.tile_size,
+            "trace_size": 0,
+        }
 
     def get_arg_spec(self):
         return [

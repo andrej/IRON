@@ -2,17 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass, field
-from typing import ClassVar, Dict
+from typing import Any, ClassVar, Dict
 
 from ml_dtypes import bfloat16
 
 from iron.common import (
     MLIROperator,
     AIERuntimeArgSpec,
-    PythonGeneratedMLIRArtifact,
-    DesignGenerator,
 )
-import aie.utils as aie_utils
 
 
 @dataclass
@@ -62,36 +59,28 @@ class StridedCopy(MLIROperator):
             )
         MLIROperator.__init__(self, context=self.context)
 
-    def get_mlir_artifact(self):
-        return PythonGeneratedMLIRArtifact(
-            f"{self.name}.mlir",
-            DesignGenerator(
-                self.operator_dir / "design.py",
-                "strided_copy",
-                (
-                    aie_utils.get_current_device(),
-                    self.dtype,
-                    self.input_buffer_size,
-                    self.input_sizes,
-                    self.input_strides,
-                    self.input_offset,
-                    self.output_buffer_size,
-                    self.output_sizes,
-                    self.output_strides,
-                    self.output_offset,
-                    self.transfer_size,
-                    self.num_aie_channels,
-                ),
-                {
-                    **self.kwargs,
-                    "input_offset_parameter": self.input_offset_parameter,
-                    "output_offset_parameter": self.output_offset_parameter,
-                },
-            ),
-        )
+    def get_design(self):
+        from iron.operators.strided_copy.design import strided_copy
 
-    def get_kernel_artifacts(self):
-        return []
+        return strided_copy
+
+    def get_design_kwargs(self) -> dict[str, Any]:
+        return {
+            "dtype": self.dtype,
+            "input_buffer_size": self.input_buffer_size,
+            "input_sizes": tuple(self.input_sizes),
+            "input_strides": tuple(self.input_strides),
+            "input_offset": self.input_offset,
+            "output_buffer_size": self.output_buffer_size,
+            "output_sizes": tuple(self.output_sizes),
+            "output_strides": tuple(self.output_strides),
+            "output_offset": self.output_offset,
+            "transfer_size": self.transfer_size,
+            "num_aie_channels": self.num_aie_channels,
+            **self.kwargs,
+            "input_offset_parameter": self.input_offset_parameter,
+            "output_offset_parameter": self.output_offset_parameter,
+        }
 
     def get_arg_spec(self):
         return [

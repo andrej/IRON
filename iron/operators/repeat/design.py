@@ -7,11 +7,20 @@ Repeat interleave
 
 import numpy as np
 
+import aie.iron as iron
 from aie.dialects.aiex import TensorAccessPattern
-from aie.iron import ObjectFifo, Program, Runtime, TaskGroup
+from aie.iron import CompileTime, ObjectFifo, Program, Runtime, TaskGroup
 
 
-def repeat(dev, dtype, rows, cols, repeat, transfer_size=None):
+@iron.jit
+def repeat(
+    *,
+    dtype: CompileTime[type],
+    rows: CompileTime[int],
+    cols: CompileTime[int],
+    repeat: CompileTime[int],
+    transfer_size: CompileTime[int] = None,
+):
     elem_bytes = np.dtype(dtype).itemsize
     dtype = np.dtype[dtype]
 
@@ -93,4 +102,4 @@ def repeat(dev, dtype, rows, cols, repeat, transfer_size=None):
             fifo_out.cons(),
         ],
     )
-    return Program(dev, rt).resolve_program()
+    return Program(iron.get_current_device(), rt).resolve_program()

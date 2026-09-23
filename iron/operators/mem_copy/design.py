@@ -8,13 +8,15 @@ from typing import List
 import numpy as np
 import math
 
+import aie.iron as iron
 from aie.iron import (
+    CompileTime,
     TaskGroup,
-    Kernel,
     ObjectFifo,
     Program,
     Runtime,
     Worker,
+    kernels,
 )
 from aie.iron.device import Tile, NPU1, NPU2
 from aie.helpers.taplib.tap import TensorAccessPattern
@@ -164,8 +166,15 @@ def create_partial_workload_config(
 #
 
 
+@iron.jit
 def my_mem_copy(
-    dev, size, num_cores, num_channels, bypass, tile_size, trace_size, func_prefix=""
+    *,
+    size: CompileTime[int],
+    num_cores: CompileTime[int],
+    num_channels: CompileTime[int],
+    bypass: CompileTime[bool],
+    tile_size: CompileTime[int],
+    trace_size: CompileTime[int],
 ):
     # --------------------------------------------------------------------------
     # Configuration
@@ -200,11 +209,7 @@ def my_mem_copy(
         # --------------------------------------------------------------------------
 
         # External, binary kernel definition
-        mem_copy_fcn = Kernel(
-            f"{func_prefix}passThroughLine",
-            f"{func_prefix}mem_copy.o",
-            [line_type, line_type, np.int32],
-        )
+        mem_copy_fcn = kernels.passthrough(tile_size=line_size, dtype=xfr_dtype)
 
         # Task for the core to perform
         num_lines = tile_size // line_size
@@ -396,7 +401,9 @@ def my_mem_copy(
     )
     # Place components (assign them resources on the device) and generate an MLIR module
     # bypass means the DMAs run without any compute worker
-    prog = Program(dev, rt, workers=None if bypass else my_workers)
+    prog = Program(
+        iron.get_current_device(), rt, workers=None if bypass else my_workers
+    )
     if not bypass:
         maybe_enable_trace(prog, trace_size, my_workers)
     return prog.resolve_program()

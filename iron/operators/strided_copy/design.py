@@ -10,8 +10,10 @@ input[0, :, 0] -> output[:, 0, 0]
 
 import numpy as np
 
+import aie.iron as iron
 from aie.dialects.aiex import TensorAccessPattern
 from aie.iron import (
+    CompileTime,
     ObjectFifo,
     Program,
     Runtime,
@@ -21,21 +23,22 @@ from aie.iron import (
 )
 
 
+@iron.jit
 def strided_copy(
-    dev,
-    dtype,
-    input_buffer_size,
-    input_sizes,
-    input_strides,
-    input_offset,
-    output_buffer_size,
-    output_sizes,
-    output_strides,
-    output_offset,
-    transfer_size=None,
-    num_aie_channels=1,
-    input_offset_parameter=None,
-    output_offset_parameter=None,
+    *,
+    dtype: CompileTime[type],
+    input_buffer_size: CompileTime[int],
+    input_sizes: CompileTime[tuple],
+    input_strides: CompileTime[tuple],
+    input_offset: CompileTime[int],
+    output_buffer_size: CompileTime[int],
+    output_sizes: CompileTime[tuple],
+    output_strides: CompileTime[tuple],
+    output_offset: CompileTime[int],
+    transfer_size: CompileTime[int] = None,
+    num_aie_channels: CompileTime[int] = 1,
+    input_offset_parameter: CompileTime[str] = None,
+    output_offset_parameter: CompileTime[str] = None,
 ):
     assert len(input_sizes) == len(input_strides)
     assert len(output_sizes) == len(output_strides)
@@ -180,4 +183,4 @@ def strided_copy(
             [of.cons() for of in fifos_out],
         ],
     )
-    return Program(dev, rt).resolve_program()
+    return Program(iron.get_current_device(), rt).resolve_program()
