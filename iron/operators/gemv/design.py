@@ -5,10 +5,19 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 import aie.dialects.index as index
+import aie.iron as iron
 from aie.dialects.aie import T
 from aie.helpers.dialects.scf import _for as range_
 from aie.helpers.taplib import TensorAccessPattern
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
+from aie.iron import (
+    CompileTime,
+    ObjectFifo,
+    Program,
+    Runtime,
+    TaskGroup,
+    Worker,
+    kernels,
+)
 
 """
 Matrix-vector design
@@ -25,24 +34,23 @@ Calls into the mv.cc kernel code. That kernel computes `m_input` output rows per
 """
 
 
+@iron.jit
 def my_matvec(
-    dev,
-    cols,
-    M,
-    K,
-    m_input,
-    m_output=None,
-    num_batches=1,
-    kernel_object="mv.o",
-    func_prefix="",
-    verbose=False,
-    epilogue="none",
+    *,
+    cols: CompileTime[int],
+    M: CompileTime[int],
+    K: CompileTime[int],
+    m_input: CompileTime[int],
+    m_output: CompileTime[int] = None,
+    num_batches: CompileTime[int] = 1,
+    kernel_vector_size: CompileTime[int] = 64,
+    verbose: CompileTime[bool] = False,
+    epilogue: CompileTime[str] = "none",
 ):
     if m_output is None:
         m_output = m_input
 
     if verbose:
-        print(f"Device: {dev}")
         print(f"Matrix dimensions: M={M}, K={K}")
         print(f"Tiling: m_input={m_input}, m_output={m_output}")
         print(f"Columns: {cols}")
@@ -81,10 +89,11 @@ def my_matvec(
     L3_C_ty = np.ndarray[(num_batches * M,), dtype_out]
 
     func_type = "vectorized" if vectorized else "scalar"
-    matvec = Kernel(
-        f"{func_prefix}matvec_{func_type}_{dtype_in_str}_{dtype_out_str}",
-        f"{func_prefix}{kernel_object}",
-        [np.int32, np.int32, L1_A_ty, L1_B_ty, L1_C_ty],
+    matvec = kernels.mv_sized(
+        dim_k=K,
+        vec_size=kernel_vector_size,
+        m_tile=m_input,
+        m_out=m_output,
     )
     # Optional fused activation over the full m_output C-tile, applied once per tile in core_body
     # (after the matvec inner-loop has filled all rows) rather than per matvec call, whose m_input
@@ -95,11 +104,7 @@ def my_matvec(
         assert (
             m_output % 16 == 0
         ), f"gelu epilogue needs m_output % 16 == 0 (got {m_output})"
-        gelu_kernel = Kernel(
-            f"{func_prefix}gelu_tile_bf16",
-            f"{func_prefix}{kernel_object}",
-            [np.int32, L1_C_ty],
-        )
+        gelu_kernel = kernels.gelu_tile(tile_size=m_output)
 
     A_L3L1_fifos = [
         ObjectFifo(L1_A_ty, name=f"A_L3L1_{i}", depth=2) for i in range(cols)
@@ -289,4 +294,4 @@ def my_matvec(
             [of.cons() for of in C_L1L3_fifos],
         ],
     )
-    return Program(dev, rt, workers=workers).resolve_program()
+    return Program(iron.get_current_device(), rt, workers=workers).resolve_program()

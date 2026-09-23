@@ -2,18 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass, field
-from typing import ClassVar, Dict
+from typing import Any, ClassVar, Dict
 
 from iron.common import (
     MLIROperator,
     AIERuntimeArgSpec,
-    KernelObjectArtifact,
-    KernelArchiveArtifact,
-    SourceArtifact,
-    PythonGeneratedMLIRArtifact,
-    DesignGenerator,
 )
-import aie.utils as aie_utils
 from iron.common.device_utils import get_kernel_dir
 
 
@@ -84,69 +78,29 @@ class GEMV(MLIROperator):
             return base
         return f"{base}_epi{self.epilogue}"
 
-    @property
-    def _kernel_link_file(self):
-        # With the gelu epilogue the core also links the gelu kernel, so both
-        # sources compile into one object; the plain matvec has only its own.
-        if self.epilogue == "gelu":
-            return f"gemv_{self.K}k_{self.kernel_vector_size}vs_gelu_kernels.o"
-        return f"gemv_{self.K}k_{self.kernel_vector_size}vs.o"
+    def get_design(self):
+        from iron.operators.gemv.design import my_matvec
 
-    def get_mlir_artifact(self):
-        mlir_verbose = getattr(self.context, "mlir_verbose", False)
+        return my_matvec
 
-        return PythonGeneratedMLIRArtifact(
-            f"{self.name}.mlir",
-            DesignGenerator(
-                self.operator_dir / "design.py",
-                "my_matvec",
-                (
-                    aie_utils.get_current_device(),
-                    self.num_aie_columns,
-                    self.M,
-                    self.K,
-                    self.tile_size_input,
-                    self.tile_size_output,
-                    self.num_batches,
-                ),
-                {
-                    "verbose": mlir_verbose,
-                    "kernel_object": self._kernel_link_file,
-                    "epilogue": self.epilogue,
-                },
-            ),
-        )
-
-    def get_kernel_artifacts(self):
-        matvec_obj = KernelObjectArtifact(
-            f"gemv_{self.K}k_{self.kernel_vector_size}vs.o",
-            dependencies=[
-                SourceArtifact(self.context.kernels_dir / "generic" / "mv.cc")
-            ],
-            extra_flags=[
-                f"-DDIM_K={self.K}",
-                f"-DVEC_SIZE={self.kernel_vector_size}",
-            ],
-        )
-        if self.epilogue == "gelu":
-            # The gelu kernel lives in aie2p/gelu.cc, so the fused epilogue is NPU2-only.
-            if get_kernel_dir() != "aie2p":
-                raise NotImplementedError(
-                    "gemv gelu epilogue is only available on NPU2 (aie2p); "
-                    f"current kernel dir is {get_kernel_dir()!r}"
-                )
-            gelu_obj = KernelObjectArtifact(
-                "gelu.o",
-                dependencies=[
-                    SourceArtifact(self.context.kernels_dir / "aie2p" / "gelu.cc")
-                ],
+    def get_design_kwargs(self) -> dict[str, Any]:
+        # The gelu kernel lives in aie2p/gelu.cc, so the fused epilogue is NPU2-only.
+        if self.epilogue == "gelu" and get_kernel_dir() != "aie2p":
+            raise NotImplementedError(
+                "gemv gelu epilogue is only available on NPU2 (aie2p); "
+                f"current kernel dir is {get_kernel_dir()!r}"
             )
-            return [
-                KernelArchiveArtifact(
-                    self._kernel_link_file, dependencies=[matvec_obj, gelu_obj]
-                )
-            ]
-        return [matvec_obj]
+        return {
+            "cols": self.num_aie_columns,
+            "M": self.M,
+            "K": self.K,
+            "m_input": self.tile_size_input,
+            "m_output": self.tile_size_output,
+            "num_batches": self.num_batches,
+            "kernel_vector_size": self.kernel_vector_size,
+            "verbose": getattr(self.context, "mlir_verbose", False),
+            "epilogue": self.epilogue,
+        }
 
     def get_arg_spec(self):
         batch_dim = (self.num_batches,) if self.num_batches > 1 else ()
