@@ -1,15 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import argparse
-from pathlib import Path
-
-from ml_dtypes import bfloat16
-
 import numpy as np
 
+import aie.iron as iron
 from aie.iron import (
-    Kernel,
+    CompileTime,
     ObjectFifo,
     Program,
     Buffer,
@@ -17,6 +13,7 @@ from aie.iron import (
     TaskGroup,
     Worker,
     WorkerRuntimeBarrier,
+    kernels,
     str_to_dtype,
 )
 from aie.iron.device import NPU1Col1, NPU1Col2, NPU1, NPU2, Tile
@@ -24,122 +21,35 @@ from aie.helpers.taplib import TensorTiler2D, TensorAccessPattern
 from aie.iron.controlflow import range_
 from iron.operators._trace import maybe_enable_trace
 
-microkernel_mac_dim_map = {
-    "npu1": {
-        "bf16": (4, 8, 4),
-    },
-    "npu1": {
-        "bf16": (4, 8, 4),
-    },
-    "npu2": {
-        "bf16": {
-            # emulate_bf16_mmul_with_bfp16
-            True: (8, 8, 8),
-            False: (4, 8, 8),
-        },
-    },
-}
-
-
-def main():
-    argparser = argparse.ArgumentParser(
-        prog="AIE Matrix Multiplication MLIR Design (Whole Array)",
-        description="Emits MLIR code for a matrix multiplication design of the given input size",
-    )
-    argparser.add_argument("--dev", type=str, choices=["npu1", "npu2"], default="npu2")
-    argparser.add_argument("-M", type=int, default=512)
-    argparser.add_argument("-K", type=int, default=512)
-    argparser.add_argument("-N", type=int, default=512)
-    argparser.add_argument("-m", type=int, default=64)
-    argparser.add_argument("-k", type=int, default=64)
-    argparser.add_argument("-n", type=int, default=32)
-    argparser.add_argument("--n-aie-cols", type=int, choices=[1, 2, 4, 8], default=4)
-    argparser.add_argument("--b-col-maj", type=int, choices=[0, 1], default=0)
-    argparser.add_argument("--c-col-maj", type=int, choices=[0, 1], default=0)
-    # Whether to use the scalar kernel; this is low, but can be useful for debugging smaller sizes
-    argparser.add_argument("--scalar", type=int, choices=[0, 1], default=0)
-    argparser.add_argument(
-        "--emulate-bf16-mmul-with-bfp16", action="store_true", default=False
-    )
-    argparser.add_argument("--prio-accuracy", action="store_true", default=False)
-    argparser.add_argument("--separate-c-tiles", type=int, choices=[0, 1], default=0)
-    argparser.add_argument(
-        "--archive",
-        type=str,
-        default=None,
-        help="Name of the archive file for the AIE kernels",
-    )
-    argparser.add_argument("--dtype_in", type=str, choices=["bf16"], default="bf16")
-    argparser.add_argument(
-        "--dtype_out",
-        type=str,
-        choices=["bf16", "f32"],
-        default="bf16",
-    )
-    argparser.add_argument("--trace_size", type=int, default=0)
-    argparser.add_argument(
-        "--output-file-path",
-        "-o",
-        type=str,
-        help="Output file path for the generated MLIR module",
-    )
-
-    args = argparser.parse_args()
-    module = my_matmul(
-        args.dev,
-        args.M,
-        args.K,
-        args.N,
-        args.m,
-        args.k,
-        args.n,
-        args.n_aie_cols,
-        args.dtype_in,
-        args.dtype_out,
-        args.b_col_maj,
-        args.c_col_maj,
-        args.scalar,
-        args.emulate_bf16_mmul_with_bfp16,
-        args.prio_accuracy,
-        args.separate_c_tiles,
-        args.trace_size,
-        args.archive,
-        "",
-    )
-
-    output_file_path = Path(args.output_file_path)
-    with open(output_file_path, "w") as f:
-        f.write(str(module))
-
 
 def ceildiv(a, b):
     return (a + b - 1) // b
 
 
-def my_matmul(
-    dev,
-    M,
-    K,
-    N,
-    m,
-    k,
-    n,
-    n_aie_cols,
-    dtype_in_str,
-    dtype_out_str,
-    b_col_maj,
-    c_col_maj,
-    use_scalar,
-    emulate_bf16_mmul_with_bfp16,
-    prio_accuracy,
-    separate_c_tiles,
-    trace_size,
-    kernel_object=None,
-    func_prefix="",
+@iron.jit
+def gemm_design(
+    *,
+    M: CompileTime[int],
+    K: CompileTime[int],
+    N: CompileTime[int],
+    m: CompileTime[int],
+    k: CompileTime[int],
+    n: CompileTime[int],
+    n_aie_cols: CompileTime[int],
+    dtype_in_str: CompileTime[str],
+    dtype_out_str: CompileTime[str],
+    b_col_maj: CompileTime[int],
+    c_col_maj: CompileTime[int],
+    use_scalar: CompileTime[bool],
+    emulate_bf16_mmul_with_bfp16: CompileTime[bool],
+    prio_accuracy: CompileTime[bool],
+    round_conv_even: CompileTime[bool],
+    separate_c_tiles: CompileTime[int],
+    trace_size: CompileTime[int],
 ):
     n_aie_rows = 4
 
-    dev_name = dev if isinstance(dev, str) else dev.resolve().name
+    dev_name = iron.get_current_device().resolve().name
 
     dtype_in = str_to_dtype(dtype_in_str)
     dtype_out = str_to_dtype(dtype_out_str)
@@ -195,12 +105,20 @@ def my_matmul(
         np.dtype(dtype_out).itemsize >= np.dtype(dtype_in).itemsize
     ), f"Output dtype ({dtype_out}) must be equal or larger to input dtype ({dtype_in})"
 
-    # r, s, t are the dimensions required by the microkernel MAC instructions.
-    mac_dims = microkernel_mac_dim_map[dev_name][dtype_in_str]
-    if dev_name == "npu2" and dtype_in_str == "bf16":
-        r, s, t = mac_dims[emulate_bf16_mmul_with_bfp16]
-    else:
-        r, s, t = mac_dims
+    matmul_kernel = kernels.mm(
+        dim_m=m,
+        dim_k=k,
+        dim_n=n,
+        input_dtype=dtype_in,
+        output_dtype=dtype_out_internal if use_larger_internal_buffer else dtype_out,
+        vectorized=not use_scalar,
+        b_col_maj=bool(b_col_maj),
+        c_col_maj=bool(c_col_maj),
+        emulate_bf16_mmul_with_bfp16=emulate_bf16_mmul_with_bfp16,
+        round_conv_even=round_conv_even,
+    )
+    zero_kernel = matmul_kernel.zero
+    r, s, t = matmul_kernel.mac_dims
 
     # npu1 is a 4 row x 4 col array
     if dev_name == "npu1" and n_aie_cols > 4:
@@ -273,12 +191,6 @@ def my_matmul(
     C_l1_ty = np.ndarray[(m, n), np.dtype[dtype_out]]
 
     # AIE Core Function declarations
-    scalar_suffix = "_scalar" if use_scalar else ""
-    gemm_object = (
-        f"{func_prefix}{kernel_object}"
-        if kernel_object
-        else f"{func_prefix}gemm_{m}x{k}x{n}.o"
-    )
     if use_larger_internal_buffer:
         # Fix fifo depth for C objfifo to 1 since 1 buffer will be used for accumulation
         # and another for transfer to L2
@@ -286,40 +198,11 @@ def my_matmul(
         # Set the type for accumulation
         C_l1_ty_internal = np.ndarray[(m, n), np.dtype[dtype_out_internal]]
         # A kernel to convert from the internal f32 accumulation to bf16 for transfer to L2 is needed
-        convert_copy_kernel = Kernel(
-            f"{func_prefix}cast_f32_bf16_row",
-            f"{func_prefix}cast_f32_bf16.o",
-            [C_l1_ty_internal, C_l1_ty, np.int32],
-        )
-        # Fix the kernels to use f32 outputs
-        zero_kernel = Kernel(
-            f"{func_prefix}zero{scalar_suffix}_f32",
-            gemm_object,
-            [C_l1_ty_internal],
-        )
-        matmul_func_name = f"{func_prefix}matmul{scalar_suffix}_{dtype_in_str}_f32"
-        matmul_kernel = Kernel(
-            matmul_func_name,
-            gemm_object,
-            [A_l1_ty, B_l1_ty, C_l1_ty_internal],
-        )
+        convert_copy_kernel = kernels.convert_copy(tile_size=m * n)
     else:
         # No need to use separate buffers for accumulation and transfer to L2, so
         # we only need the zero and matmul kernels
         fifo_depth_out = fifo_depth
-        zero_kernel = Kernel(
-            f"{func_prefix}zero{scalar_suffix}_{dtype_out_str}",
-            gemm_object,
-            [C_l1_ty],
-        )
-        matmul_func_name = (
-            f"{func_prefix}matmul{scalar_suffix}_{dtype_in_str}_{dtype_out_str}"
-        )
-        matmul_kernel = Kernel(
-            matmul_func_name,
-            gemm_object,
-            [A_l1_ty, B_l1_ty, C_l1_ty],
-        )
 
     # Tile declarations as tile[row][col]
     tiles = [[(col, row) for col in range(0, n_aie_cols)] for row in range(0, 6)]
@@ -788,7 +671,3 @@ def my_matmul(
 
     # Place components (assign them resources on the device) and generate an MLIR module.
     return my_program.resolve_program()
-
-
-if __name__ == "__main__":
-    main()

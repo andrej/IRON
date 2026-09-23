@@ -2,21 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass, field
-from typing import ClassVar, Dict
+from typing import Any, ClassVar, Dict
 
 import numpy as np
 
 from iron.common import (
     MLIROperator,
     AIERuntimeArgSpec,
-    KernelObjectArtifact,
-    SourceArtifact,
-    PythonGeneratedMLIRArtifact,
-    DesignGenerator,
 )
-from iron.common.device_utils import get_kernel_dir
 from aie.iron import str_to_dtype
-import aie.utils as aie_utils
 
 
 @dataclass
@@ -87,86 +81,31 @@ class GEMM(MLIROperator):
 
         MLIROperator.__init__(self, context=self.context)
 
-    @property
-    def _kernel_flags_suffix(self):
-        """Suffix encoding compile-time flags that affect the kernel binary."""
-        return f"_{int(self.prio_accuracy)}_{int(self.emulate_bf16_mmul_with_bfp16)}_{int(self.round_conv_even)}"
+    def get_design(self):
+        from iron.operators.gemm.design import gemm_design
 
-    def get_mlir_artifact(self):
-        return PythonGeneratedMLIRArtifact(
-            f"{self.name}.mlir",
-            DesignGenerator(
-                self.operator_dir / "design.py",
-                "my_matmul",
-                (),
-                {
-                    "dev": aie_utils.get_current_device(),
-                    "M": self.M,
-                    "K": self.K,
-                    "N": self.N,
-                    "m": self.tile_m,
-                    "k": self.tile_k,
-                    "n": self.tile_n,
-                    "n_aie_cols": self.num_aie_columns,
-                    "dtype_in_str": self.dtype_in,
-                    "dtype_out_str": self.dtype_out,
-                    "b_col_maj": int(self.b_col_maj),
-                    "c_col_maj": int(self.c_col_maj),
-                    "use_scalar": self.use_scalar,
-                    "emulate_bf16_mmul_with_bfp16": self.emulate_bf16_mmul_with_bfp16,
-                    "prio_accuracy": self.prio_accuracy,
-                    "separate_c_tiles": int(self.separate_c_tiles),
-                    "trace_size": 0,
-                    "kernel_object": f"gemm_{self.tile_m}x{self.tile_k}x{self.tile_n}_{int(self.b_col_maj)}_{int(self.c_col_maj)}{self._kernel_flags_suffix}.o",
-                },
-            ),
-        )
+        return gemm_design
 
-    def get_kernel_artifacts(self):
-        base_dir = self.context.base_dir
-        kernel_flags = [
-            f"-DDIM_M={self.tile_m}",
-            f"-DDIM_K={self.tile_k}",
-            f"-DDIM_N={self.tile_n}",
-        ]
-        if self.prio_accuracy:
-            kernel_flags.append("-Dbf16_f32_ONLY")
-        else:
-            kernel_flags.append("-Dbf16_bf16_ONLY")
-        if self.round_conv_even:
-            kernel_flags.append("-DROUND_CONV_EVEN")
-        if self.emulate_bf16_mmul_with_bfp16:
-            kernel_flags.append("-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16")
-        if self.b_col_maj:
-            kernel_flags.append("-DB_COL_MAJ")
-        if self.c_col_maj:
-            kernel_flags.append("-DC_COL_MAJ")
-
-        kernel_dir = get_kernel_dir()
-        # INTERIM: aie2 sources a patched mm.cc from the tree (see the rounding
-        # note in aie_kernels/aie2/mm.cc); aie2p is unaffected and sources from
-        # the package. The -I lets the in-tree file's zero.cc and
-        # ../aie_kernel_utils.h includes resolve from the unchanged package copies.
-        if kernel_dir == "aie2":
-            mm_source = base_dir / "aie_kernels" / kernel_dir / "mm.cc"
-            kernel_flags.append(f"-I{self.context.kernels_dir / kernel_dir}")
-        else:
-            mm_source = self.context.kernels_dir / kernel_dir / "mm.cc"
-        return [
-            KernelObjectArtifact(
-                f"gemm_{self.tile_m}x{self.tile_k}x{self.tile_n}_{int(self.b_col_maj)}_{int(self.c_col_maj)}{self._kernel_flags_suffix}.o",
-                extra_flags=kernel_flags,
-                dependencies=[SourceArtifact(mm_source)],
-            ),
-            KernelObjectArtifact(
-                "cast_f32_bf16.o",
-                [
-                    SourceArtifact(
-                        self.context.kernels_dir / "aie2p" / "cast_f32_bf16.cc"
-                    )
-                ],
-            ),
-        ]
+    def get_design_kwargs(self) -> dict[str, Any]:
+        return {
+            "M": self.M,
+            "K": self.K,
+            "N": self.N,
+            "m": self.tile_m,
+            "k": self.tile_k,
+            "n": self.tile_n,
+            "n_aie_cols": self.num_aie_columns,
+            "dtype_in_str": self.dtype_in,
+            "dtype_out_str": self.dtype_out,
+            "b_col_maj": int(self.b_col_maj),
+            "c_col_maj": int(self.c_col_maj),
+            "use_scalar": self.use_scalar,
+            "emulate_bf16_mmul_with_bfp16": self.emulate_bf16_mmul_with_bfp16,
+            "prio_accuracy": self.prio_accuracy,
+            "round_conv_even": self.round_conv_even,
+            "separate_c_tiles": int(self.separate_c_tiles),
+            "trace_size": 0,
+        }
 
     def get_arg_spec(self):
         dtype_in = str_to_dtype(self.dtype_in)
