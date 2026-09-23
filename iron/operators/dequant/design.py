@@ -4,21 +4,29 @@
 from ml_dtypes import bfloat16
 import numpy as np
 
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
+import aie.iron as iron
+from aie.iron import (
+    CompileTime,
+    ObjectFifo,
+    Program,
+    Runtime,
+    TaskGroup,
+    Worker,
+    kernels,
+)
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
 
-from iron.common.device_utils import get_kernel_dir
 
-
+@iron.jit
 def my_dequant_kernel(
-    dev,
-    num_elements,
-    num_columns,
-    num_channels,
-    trace_size,
-    tile_size,
-    group_size,
+    *,
+    num_elements: CompileTime[int],
+    num_columns: CompileTime[int],
+    num_channels: CompileTime[int],
+    trace_size: CompileTime[int],
+    tile_size: CompileTime[int],
+    group_size: CompileTime[int],
 ):
     per_tile_elements = (
         16384 if tile_size > 16384 else tile_size
@@ -62,11 +70,7 @@ def my_dequant_kernel(
     ]
 
     # AIE Core Function declaration
-    dequant_kernel = Kernel(
-        "expand_uint4_to_bfloat16",
-        f"expand_{get_kernel_dir(dev)}_{tile_size}.o",
-        [in_tile_ty, out_tile_ty],
-    )
+    dequant_kernel = kernels.expand(tile_size=per_tile_elements, group_size=group_size)
 
     # Define a task that will run on a compute tile
     def core_body(of_in1, of_out, dequant_kernel):
@@ -154,7 +158,7 @@ def my_dequant_kernel(
         ],
     )
     # Place program components (assign them resources on the device) and generate an MLIR module
-    prog = Program(dev, rt, workers=my_workers)
+    prog = Program(iron.get_current_device(), rt, workers=my_workers)
     if enable_trace:
         prog.enable_trace(trace_size)
     return prog.resolve_program()

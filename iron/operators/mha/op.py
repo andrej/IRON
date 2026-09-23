@@ -2,19 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass, field
-from typing import ClassVar, Dict
+from typing import Any, ClassVar, Dict
 
 import numpy as np
 
 from iron.common import (
     MLIROperator,
     AIERuntimeArgSpec,
-    KernelObjectArtifact,
-    SourceArtifact,
-    PythonGeneratedMLIRArtifact,
-    DesignGenerator,
 )
-import aie.utils as aie_utils
 
 
 @dataclass
@@ -42,67 +37,25 @@ class MHA(MLIROperator):
             raise ValueError(f"Only d=64 is supported in this version, got d={self.d}")
         MLIROperator.__init__(self, context=self.context)
 
-    def get_mlir_artifact(self):
-        return PythonGeneratedMLIRArtifact(
-            f"{self.name}.mlir",
-            DesignGenerator(
-                self.operator_dir / "design.py",
-                "fused_mha",
-                (),
-                {
-                    "dev": aie_utils.get_current_device(),
-                    "heads": self.num_heads,
-                    "S_q": self.seq_len,
-                    "S_kv": self.seq_len,
-                    "d": self.d,
-                    "B_q": self.B_q,
-                    "B_kv": self.B_kv,
-                    "num_KV_heads": self.num_KV_heads,
-                    "number_of_pipelines": self.num_of_pipelines,
-                    "emulate_bf16_mmul_with_bfp16": True,
-                    "trace_size": 0,
-                    "verbose": False,
-                },
-            ),
-        )
+    def get_design(self):
+        from iron.operators.mha.design import fused_mha
 
-    def get_kernel_artifacts(self):
-        mm_source = str(self.context.kernels_dir / "aie2p" / "mm.cc")
-        softmax_source = str(self.context.kernels_dir / "aie2p" / "softmax.cc")
-        mha_source = str(self.context.kernels_dir / "aie2p" / "mha.cc")
-        passthrough_source = str(
-            self.context.kernels_dir / "generic" / "passThrough.cc"
-        )
+        return fused_mha
 
-        mm_defines_rowmaj = [
-            "-Dbf16_bf16_ONLY",
-            f"-DDIM_M={self.B_q}",
-            f"-DDIM_K={self.d}",
-            f"-DDIM_N={self.B_kv}",
-            "-DROUND_CONV_EVEN",
-            "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
-        ]
-        mm_defines_colmaj = mm_defines_rowmaj + [
-            "-DB_COL_MAJ",
-        ]
-        # mha.cc #includes softmax.cc and mm.cc (both col-major and row-major)
-        # directly, so everything is compiled into a single mha.o translation unit.
-        return [
-            KernelObjectArtifact(
-                "mha.o",
-                extra_flags=mm_defines_colmaj,
-                dependencies=[
-                    SourceArtifact(mha_source),
-                    SourceArtifact(mm_source),
-                    SourceArtifact(softmax_source),
-                ],
-            ),
-            KernelObjectArtifact(
-                "mha_passThrough.o",
-                extra_flags=["-DBIT_WIDTH=16"],
-                dependencies=[SourceArtifact(passthrough_source)],
-            ),
-        ]
+    def get_design_kwargs(self) -> dict[str, Any]:
+        return {
+            "heads": self.num_heads,
+            "S_q": self.seq_len,
+            "S_kv": self.seq_len,
+            "d": self.d,
+            "B_q": self.B_q,
+            "B_kv": self.B_kv,
+            "num_KV_heads": self.num_KV_heads,
+            "number_of_pipelines": self.num_of_pipelines,
+            "emulate_bf16_mmul_with_bfp16": True,
+            "trace_size": 0,
+            "verbose": False,
+        }
 
     def get_arg_spec(self):
         seq_padding = self._calculate_seq_padding(self.seq_len, self.num_of_pipelines)

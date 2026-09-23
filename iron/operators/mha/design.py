@@ -10,8 +10,9 @@ from pathlib import Path
 from ml_dtypes import bfloat16
 import numpy as np
 
+import aie.iron as iron
 from aie.iron import (
-    Kernel,
+    CompileTime,
     ObjectFifo,
     Program,
     Runtime,
@@ -19,6 +20,7 @@ from aie.iron import (
     Worker,
     Buffer,
     WorkerRuntimeBarrier,
+    kernels,
 )
 from aie.iron.device import NPU2, Tile
 from aie.iron.controlflow import range_
@@ -29,22 +31,6 @@ from iron.operators._trace import maybe_enable_trace, resolve_trace_size
 dtype_map = {
     "bf16": bfloat16,
     "f32": np.float32,
-}
-
-microkernel_mac_dim_map = {
-    "npu": {
-        "bf16": (4, 8, 4),
-    },
-    "npu1": {
-        "bf16": (4, 8, 4),
-    },
-    "npu2": {
-        "bf16": {
-            # emulate_bf16_mmul_with_bfp16
-            True: (8, 8, 8),
-            False: (4, 8, 8),
-        },
-    },
 }
 
 
@@ -106,19 +92,20 @@ def main():
         print(f"MLIR module written to {output_file_path}")
 
 
+@iron.jit
 def fused_mha(
-    dev,
-    heads: int,
-    S_q: int,
-    S_kv: int,
-    d: int,
-    B_q: int,
-    B_kv: int,
-    number_of_pipelines: int,
-    num_KV_heads: int,
-    emulate_bf16_mmul_with_bfp16: bool,
-    trace_size: int = 0,
-    verbose: bool = False,
+    *,
+    heads: CompileTime[int],
+    S_q: CompileTime[int],
+    S_kv: CompileTime[int],
+    d: CompileTime[int],
+    B_q: CompileTime[int],
+    B_kv: CompileTime[int],
+    number_of_pipelines: CompileTime[int],
+    num_KV_heads: CompileTime[int],
+    emulate_bf16_mmul_with_bfp16: CompileTime[bool],
+    trace_size: CompileTime[int] = 0,
+    verbose: CompileTime[bool] = False,
 ):
 
     of_depth = 2
@@ -153,11 +140,10 @@ def fused_mha(
     ), "Only emulate_bf16_mmul_with_bfp16=True is supported"
 
     # r, s, t are the dimensions required by the microkernel MAC instructions.
-    mac_dims = microkernel_mac_dim_map["npu2"][dtype_str]
-    r, s, t = mac_dims[emulate_bf16_mmul_with_bfp16]
+    mha_kernel = kernels.mha(b_q=B_q, b_kv=B_kv, d=d, vectorized=vectorized)
+    r, s, t = mha_kernel.mac_dims
 
     if verbose:
-        print(f"Device: {dev}")
         print(f"Number of heads: {heads}")
         print(f"MHA Dimensions: S_q={S_q}, S_kv={S_kv}, d={d}, B_q={B_q}, B_kv={B_kv}")
         print(f"Padded Dimensions: S_q_pad={S_q_pad}, S_kv_pad={S_kv_pad}")
@@ -212,56 +198,13 @@ def fused_mha(
     s_ty = np.ndarray[(4 * B_q,), np.dtype[dtype]]
 
     # AIE kernel declarations
-    func_type = "" if vectorized else "_scalar"
-    zero_kernel = Kernel(f"zero_{dtype_str}", "mha.o", [qk_ty])
-
-    memcopy_kernel_scale = Kernel(
-        f"passThroughLine", "mha_passThrough.o", [s_ty, s_ty, np.int32]
-    )
-
-    scale_buffer_init_kernel = Kernel("init_scale_buffer", "mha.o", [s_ty, np.int32])
-
-    partial_softmax_kernel = Kernel(
-        "partial_softmax",
-        "mha.o",
-        [
-            qk_ty,
-            qk_ty,
-            s_ty,
-            np.ndarray[(2,), np.dtype[np.int32]],
-            dtype,
-            np.int32,
-            np.int32,
-            np.int32,
-            np.int32,
-        ],
-    )
-
-    matmul_QK = Kernel(
-        f"matmul_bf16_bf16_wrapper{func_type}",
-        "mha.o",
-        [q_ty, k_ty, qk_ty, np.ndarray[(2,), np.dtype[np.int32]]],
-    )
-
-    matmul_PV = Kernel(
-        "matmul_PV",
-        "mha.o",
-        [
-            qk_ty,
-            k_ty,
-            qk_ty,
-            s_ty,
-            np.int32,
-            np.int32,
-            np.ndarray[(2,), np.dtype[np.int32]],
-        ],
-    )
-
-    rescale_O = Kernel(
-        "rescale_O",
-        "mha.o",
-        [qk_ty, s_ty, np.int32, np.ndarray[(2,), np.dtype[np.int32]]],
-    )
+    zero_kernel = mha_kernel.zero
+    memcopy_kernel_scale = kernels.passthrough(tile_size=4 * B_q, dtype=dtype)
+    scale_buffer_init_kernel = mha_kernel.init_scale_buffer
+    partial_softmax_kernel = mha_kernel.partial_softmax
+    matmul_QK = mha_kernel
+    matmul_PV = mha_kernel.matmul_pv
+    rescale_O = mha_kernel.rescale_o
 
     # AIE-array data movement with object fifos
     q_dims = None
@@ -875,9 +818,10 @@ def fused_mha(
     )
 
     # Create the program from the device type and runtime
-    dev_ty = NPU2()
     my_program = Program(
-        dev_ty, rt, workers=matmul_workers + softmax_workers + matmul_pv_workers
+        iron.get_current_device(),
+        rt,
+        workers=matmul_workers + softmax_workers + matmul_pv_workers,
     )
     maybe_enable_trace(
         my_program, trace_size, matmul_workers + softmax_workers + matmul_pv_workers

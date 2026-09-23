@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 from ml_dtypes import bfloat16
@@ -9,13 +10,7 @@ from ml_dtypes import bfloat16
 from iron.common import (
     MLIROperator,
     AIERuntimeArgSpec,
-    KernelObjectArtifact,
-    SourceArtifact,
-    PythonGeneratedMLIRArtifact,
-    DesignGenerator,
 )
-from iron.common.device_utils import get_kernel_dir
-import aie.utils as aie_utils
 
 
 @dataclass
@@ -44,37 +39,20 @@ class Dequant(MLIROperator):
             raise ValueError(f"total cores ({total_cores}) must be <= 16")
         MLIROperator.__init__(self, context=self.context)
 
-    def get_mlir_artifact(self):
-        return PythonGeneratedMLIRArtifact(
-            f"{self.name}.mlir",
-            DesignGenerator(
-                self.operator_dir / "design.py",
-                "my_dequant_kernel",
-                (
-                    aie_utils.get_current_device(),
-                    self.size,
-                    self.num_aie_columns,
-                    self.num_channels,
-                    0,
-                    self.tile_size,
-                    self.group_size,
-                ),
-            ),
-        )
+    def get_design(self):
+        from iron.operators.dequant.design import my_dequant_kernel
 
-    def get_kernel_artifacts(self):
-        return [
-            KernelObjectArtifact(
-                f"expand_{get_kernel_dir()}_{self.tile_size}.o",
-                dependencies=[
-                    SourceArtifact(self.context.kernels_dir / "generic" / "expand.cc")
-                ],
-                extra_flags=[
-                    f"-DTILE_SIZE={self.tile_size}",
-                    f"-DGROUP_SIZE={self.group_size}",
-                ],
-            )
-        ]
+        return my_dequant_kernel
+
+    def get_design_kwargs(self) -> dict[str, Any]:
+        return {
+            "num_elements": self.size,
+            "num_columns": self.num_aie_columns,
+            "num_channels": self.num_channels,
+            "trace_size": 0,
+            "tile_size": self.tile_size,
+            "group_size": self.group_size,
+        }
 
     def get_arg_spec(self):
         return [
