@@ -250,8 +250,9 @@ class CompareDispatch(SeparateDispatch):
         tolerance: How close every step's output must come to its reference.
             By default each step is held to its operator's
             ``reference_tolerance()``, the contract of the kernel it runs, as
-            its own test holds it; a step without one that can be judged
-            element by element falls back to ``FALLBACK_TOLERANCE``.
+            its own test holds it. A bound tolerance's bound takes the
+            step's reference inputs. A step without a tolerance, or with a
+            ``range_frac``, falls back to ``FALLBACK_TOLERANCE``.
         raise_on_mismatch: When True (default), raise ``RuntimeError`` on the
             first mismatching step instead of only logging it.
     """
@@ -270,7 +271,7 @@ class CompareDispatch(SeparateDispatch):
         if self.tolerance is not None:
             return self.tolerance
         tol = op.reference_tolerance() if isinstance(op, MLIROperator) else None
-        if tol is None or tol.kind == "bound" or tol.range_frac is not None:
+        if tol is None or tol.range_frac is not None:
             return self.FALLBACK_TOLERANCE
         return tol
 
@@ -939,7 +940,8 @@ class SequenceCompareCallable(SequenceXclbinCallable):
             npu_np = npu_raw.view(torch.uint16).numpy().view(ml_dtypes.bfloat16)
         else:
             npu_np = npu_raw.numpy()
-        verdict = compare(npu_np, ref_flat.numpy(), tol)
+        bound = tol.bound(*cpu_inputs) if tol.kind == "bound" else None
+        verdict = compare(npu_np, ref_flat.numpy(), tol, bound=bound)
         fail = not verdict
         stats["mismatch"] = fail
         level = logging.ERROR if fail else logging.INFO
