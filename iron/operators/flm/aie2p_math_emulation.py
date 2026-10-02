@@ -23,7 +23,10 @@ from ml_dtypes import bfloat16
 
 from aie.utils import bfp, config
 
-from iron.operators.flm.q4nx import bf16_to_f32
+
+def bf16_to_f32(u16):
+    """bf16 bit patterns to their float32 values."""
+    return (np.asarray(u16).astype(np.uint32) << 16).view(np.float32)
 
 
 def f32_to_bf16_floor(x):

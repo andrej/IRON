@@ -11,7 +11,8 @@ from aie.utils.benchmark import run_iters
 
 from iron.operators.flm.lm_head.op import LMHead
 from iron.operators.flm.lm_head.reference import dequantize, reference
-from iron.operators.flm.q4nx import GROUP, K_TILE, M_TILE
+from iron.operators.flm import q4nx
+from iron.operators.flm.q4nx import K_TILE, M_TILE
 from iron.operators.flm.testing import requires_aie2p
 
 # The initial value of y. No logit of the test inputs reaches it, so an
@@ -38,18 +39,8 @@ def _inputs(dim, vocab, seed):
     of 30 bends.
     """
     rng = np.random.default_rng(seed)
-    groups = K_TILE // GROUP
     n_blocks = vocab * dim // (M_TILE * K_TILE)
-    params = np.concatenate(
-        [
-            rng.uniform(0, 0.02, (n_blocks, groups * M_TILE)),
-            rng.uniform(-0.15, 0, (n_blocks, groups * M_TILE)),
-        ],
-        axis=1,
-    )
-    params = params.astype(bfloat16).view(np.uint16).astype("<u2").view(np.uint8)
-    codes = rng.integers(0, 256, (n_blocks, M_TILE * K_TILE // 2), dtype=np.uint8)
-    w = np.concatenate([params, codes], axis=1).reshape(-1)
+    w = q4nx.random_blocks(rng, n_blocks, (0, 0.02), (-0.15, 0), "rne").reshape(-1)
     x = np.concatenate([rng.standard_normal(dim), rng.uniform(0.5, 1.5, dim)])
     return w, x.astype(bfloat16)
 
