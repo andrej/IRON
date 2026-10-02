@@ -95,6 +95,10 @@ class ChunkCopy(MLIROperator):
     def get_dispatch_params(self):
         return {"n": np.int32}
 
+    def validate_dispatch_params(self, n):
+        if not 0 <= n <= self.max_chunks:
+            raise ValueError(f"n ({n}) must be in [0, {self.max_chunks}]")
+
 
 MAX_CHUNKS = 16
 
@@ -174,6 +178,16 @@ def test_set_parameters_takes_exactly_the_declared_names(chunk_copy_op, params):
     run = chunk_copy_op.get_callable()
     with pytest.raises(TypeError, match="takes exactly"):
         run.set_parameters(**params)
+
+
+@pytest.mark.parametrize("n", [-1, MAX_CHUNKS + 1])
+def test_set_parameters_rejects_values_outside_the_design(chunk_copy_op, n):
+    """set_parameters() raises the operator's error before any dispatch."""
+    run = chunk_copy_op.get_callable()
+    with pytest.raises(ValueError, match=r"must be in \[0, 16\]"):
+        run.set_parameters(n=n)
+    with pytest.raises(RuntimeError, match="set_parameters"):
+        run()
 
 
 @pytest.mark.parametrize("dispatch", ["auto", "fused", "separate", "reference"])
