@@ -43,12 +43,8 @@ from iron.operators.flm.layer.design import (
     MIN_BF16_PAD,
     SLIDING_WINDOW,
 )
+from iron.operators.flm.kernel_constants import BF16_K, BF16_M, RMS_EPS
 from iron.operators.flm.q4nx import BLOCK_BYTES, GROUP, K_TILE, M_TILE, packed_bytes
-
-# The epsilon of aie_kernels/flm_gemma4/rms_norm.h.
-RMS_EPS = 1e-6
-# The block of a bf16 projection, from aie_kernels/flm_gemma4/decode_bf16_proj.h.
-BF16_M, BF16_K = 32, 256
 
 
 def layer_dims(geometry, layer_type):
