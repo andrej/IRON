@@ -184,6 +184,14 @@ class MLIROperator(AIEOperatorBase):
         """
         return {}
 
+    def validate_dispatch_params(self, **params: int) -> None:
+        """Raise ValueError if the design cannot run with these dispatch parameters.
+
+        A value outside the design's range can move a transfer past the end of
+        its buffer. :meth:`DispatchCallable.set_parameters` calls this method,
+        so the error appears before any dispatch.
+        """
+
     def get_artifacts(
         self, prefix: str = ""
     ) -> tuple[XclbinArtifact, InstsBinArtifact]:
@@ -238,7 +246,8 @@ class MLIROperator(AIEOperatorBase):
                     kernel_name=self.xclbin_artifact.kernel_name,
                     dispatch_params=list(dispatch_params),
                     dispatch_lib_path=Path(self.dispatch_artifact.filename).resolve(),
-                )
+                ),
+                validate=self.validate_dispatch_params,
             )
         npu_kernel = NPUKernel(
             xclbin_path=self.xclbin_artifact.filename,
@@ -258,10 +267,16 @@ class DispatchCallable:
 
     ``set_parameters()`` sets the parameters of every later call. Each call
     generates the instruction stream for those parameters and runs it.
+    ``validate``, if given, checks the parameters in ``set_parameters()``.
     """
 
-    def __init__(self, npu_kernel: NPUKernel) -> None:
+    def __init__(
+        self,
+        npu_kernel: NPUKernel,
+        validate: Callable[..., None] | None = None,
+    ) -> None:
         self._npu_kernel = npu_kernel
+        self._validate = validate
         self._params: dict[str, int] | None = None
 
     def set_parameters(self, **params: int) -> None:
@@ -270,6 +285,8 @@ class DispatchCallable:
             raise TypeError(
                 f"set_parameters() takes exactly {expected}, got {sorted(params)}"
             )
+        if self._validate is not None:
+            self._validate(**params)
         self._params = params
 
     def __call__(self, *args):
