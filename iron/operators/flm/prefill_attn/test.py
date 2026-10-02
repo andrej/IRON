@@ -212,3 +212,50 @@ def test_gemma4_cache_bound(kind, num_kv_heads, aie_context):
 def test_rejects_unservable_shapes(cls, kwargs, match, aie_context):
     with pytest.raises(ValueError, match=match):
         cls(**{"max_context": 1024, "num_heads": 8, **kwargs}, context=aie_context)
+
+
+@requires_aie2p
+@pytest.mark.parametrize("cls", [PrefillAttention, PrefillSlidingAttention])
+@pytest.mark.parametrize(
+    "L_begin, L_end, max_l, match",
+    [
+        (0, 100, 1024, "multiples of 128"),
+        (64, 128, 1024, "multiples of 128"),
+        (-128, 128, 1024, "0 <= L_begin"),
+        (256, 128, 1024, "0 <= L_begin"),
+        (0, 1024, 512, "0 <= L_begin"),
+        (0, 128, 2048, "0 <= L_begin"),
+    ],
+)
+def test_rejects_dispatch_params_outside_the_design(
+    cls, L_begin, L_end, max_l, match, aie_context
+):
+    """set_parameters() calls this check. It needs no build."""
+    op = cls(max_context=1024, num_heads=8, num_kv_heads=1, context=aie_context)
+    with pytest.raises(ValueError, match=match):
+        op.validate_dispatch_params(L_begin=L_begin, L_end=L_end, max_l=max_l)
+
+
+@requires_aie2p
+@pytest.mark.parametrize("kind", OPERATORS)
+def test_accepts_the_tested_and_the_engine_dispatch_params(kind, aie_context):
+    cls, kwargs, ranges = OPERATORS[kind]
+    op = cls(num_heads=NUM_HEADS, num_kv_heads=1, context=aie_context, **kwargs)
+    for r in ranges:
+        op.validate_dispatch_params(*r)
+    # The ranges of test_gemma4_cache_bound, and the last range of its cache.
+    op = cls(
+        num_heads=NUM_HEADS,
+        num_kv_heads=1,
+        context=aie_context,
+        **{**kwargs, "max_context": 32768},
+    )
+    for r in [
+        (0, 2048, 4096),
+        (2048, 2304, 4096),
+        (0, 1024, 32768),
+        (32640, 32768, 32768),
+        # An empty range runs no round.
+        (128, 128, 4096),
+    ]:
+        op.validate_dispatch_params(*r)

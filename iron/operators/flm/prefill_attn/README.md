@@ -49,6 +49,9 @@ stream for the values of the last `set_parameters()` call:
 `max_context` sets the buffer sizes in the argument spec. `max_l` sets the
 first row of V in the cache.
 
+`set_parameters()` raises a `ValueError` unless
+`0 <= L_begin <= L_end <= max_l <= max_context`.
+
 ## Layout
 
 With `dh` the head dim:

@@ -22,6 +22,7 @@ from iron.operators.flm.prefill_attn.design import (
     CAUSAL,
     IN_CONS_LOCK,
     IN_PROD_LOCK,
+    ROUND,
     SLIDING,
     Geometry,
     Variant,
@@ -97,6 +98,26 @@ class _PrefillAttentionBase(MLIROperator):
         The README describes each parameter.
         """
         return {"L_begin": np.int32, "L_end": np.int32, "max_l": np.int32}
+
+    def validate_dispatch_params(self, L_begin, L_end, max_l):
+        """Require 0 <= L_begin <= L_end <= max_l <= max_context, with L_begin
+        and L_end multiples of ROUND.
+
+        The sequence runs whole rounds of ROUND query rows. An unaligned range
+        therefore reads q and k rows past L_end and writes o rows past it. The
+        reads of k and v end at row L_end of each half. v starts at row max_l.
+        An empty range runs no round.
+        """
+        if L_begin % ROUND or L_end % ROUND:
+            raise ValueError(
+                f"L_begin ({L_begin}) and L_end ({L_end}) must be multiples "
+                f"of {ROUND}"
+            )
+        if not 0 <= L_begin <= L_end <= max_l <= self.max_context:
+            raise ValueError(
+                f"the dispatch needs 0 <= L_begin ({L_begin}) <= L_end ({L_end}) "
+                f"<= max_l ({max_l}) <= max_context ({self.max_context})"
+            )
 
     def get_mlir_artifact(self):
         return PythonGeneratedMLIRArtifact(
