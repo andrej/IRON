@@ -5,26 +5,8 @@
 
 import numpy as np
 
-from iron.operators.flm.q4nx import BLOCK_BYTES, GROUP, K_TILE, M_TILE, bf16_to_f32
-
-
-def dequantize_block(block):
-    """One q4nx block to its (M_TILE, K_TILE) weights.
-
-    The block stores the scales and the minima at ``[k // GROUP, m]``. It
-    stores the 4-bit codes at ``[m // 16, k // 32, k % 32, m % 16]``. Each byte
-    holds the code with the lower index in its low nibble.
-    """
-    groups = K_TILE // GROUP
-    params = bf16_to_f32(np.frombuffer(block[: 4 * groups * M_TILE], "<u2"))
-    scales, mins = params.reshape(2, groups, M_TILE).astype(np.float64)
-    packed = np.frombuffer(block[4 * groups * M_TILE :], np.uint8)
-    codes = np.empty(M_TILE * K_TILE, np.float64)
-    codes[0::2], codes[1::2] = packed & 15, packed >> 4
-    codes = codes.reshape(M_TILE // 16, K_TILE // 32, 32, 16)
-    codes = codes.transpose(0, 3, 1, 2).reshape(M_TILE, K_TILE)
-    k_group = np.arange(K_TILE) // GROUP
-    return mins[k_group].T + scales[k_group].T * codes
+from iron.operators.flm import q4nx
+from iron.operators.flm.q4nx import BLOCK_BYTES, K_TILE, M_TILE
 
 
 def dequantize(w, dim, vocab, cols, rows):
@@ -34,15 +16,13 @@ def dequantize(w, dim, vocab, cols, rows):
     Its k-th block has block index
     ``((round * cols + col) * k_blocks + k) * rows + row``.
     """
-    w = np.asarray(w).view(np.uint8)
-    k_blocks = dim // K_TILE
+    blocks = np.asarray(w).view(np.uint8).reshape(-1, dim // K_TILE, rows, BLOCK_BYTES)
     out = np.empty((vocab, dim), np.float64)
-    for index in range(vocab // M_TILE * k_blocks):
-        rows_k, row = divmod(index, rows)
-        slice_, k = divmod(rows_k, k_blocks)
-        n0 = (slice_ * rows + row) * M_TILE
-        block = w[index * BLOCK_BYTES : (index + 1) * BLOCK_BYTES]
-        out[n0 : n0 + M_TILE, k * K_TILE : (k + 1) * K_TILE] = dequantize_block(block)
+    span = rows * M_TILE
+    # One (round, col) slice at a time bounds the float64 temporaries.
+    for i, blocks_i in enumerate(blocks):
+        weights = q4nx.dequantize(blocks_i, np.float64).transpose(1, 2, 0, 3)
+        out[i * span : (i + 1) * span] = weights.reshape(span, dim)
     return out
 
 

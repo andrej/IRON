@@ -24,7 +24,9 @@ import dataclasses
 import numpy as np
 from aie.iron.kernels import bf16_exp_lut_ref
 
+from iron.operators.flm import q4nx
 from iron.operators.flm.aie2p_math_emulation import (
+    bf16_to_f32,
     bfp16,
     f32,
     fast_rsqrt,
@@ -41,14 +43,7 @@ from iron.operators.flm.layer.design import (
     MIN_BF16_PAD,
     SLIDING_WINDOW,
 )
-from iron.operators.flm.q4nx import (
-    BLOCK_BYTES,
-    GROUP,
-    K_TILE,
-    M_TILE,
-    bf16_to_f32,
-    packed_bytes,
-)
+from iron.operators.flm.q4nx import BLOCK_BYTES, GROUP, K_TILE, M_TILE, packed_bytes
 
 # The epsilon of aie_kernels/flm_gemma4/rms_norm.h.
 RMS_EPS = 1e-6
@@ -176,32 +171,22 @@ def rms_norm(x, w):
 # ---------------------------------------------------------------------------
 
 
-# The bytes of a q4nx block's bf16 scales and minima.
-_SM_BYTES = 2 * 2 * M_TILE * K_TILE // GROUP
-
-
 def parse_q4nx(proj_u8, offset, rows, cols):
     """A q4nx weight in natural order: (codes [rows, cols], scales and mins
     [rows, cols / 32]). The weight is min + scale * code.
 
-    A block holds 32 rows by 256 columns in 5120 bytes: 256 bf16 scales, 256 bf16
-    minima at index g * 32 + r, then 8192 4-bit codes at nibble
-    (r // 16) * 4096 + c * 16 + r % 16, low nibble first. Blocks go by pairs of
-    32-row bands: column block c of band 2p, then of band 2p + 1.
+    Blocks go by pairs of 32-row bands: column block c of band 2p, then of
+    band 2p + 1.
     """
     nb_r, nb_c = rows // M_TILE, cols // K_TILE
     blk = proj_u8[offset : offset + nb_r * nb_c * BLOCK_BYTES]
-    blk = blk.reshape(nb_r // 2, nb_c, 2, BLOCK_BYTES).transpose(0, 2, 1, 3)
-    blk = blk.reshape(nb_r, nb_c, BLOCK_BYTES)
-    sm = blk[..., :_SM_BYTES].copy().view("<u2")
-    sm = bf16_to_f32(sm.reshape(nb_r, nb_c, 2, K_TILE // GROUP, M_TILE))
-    sm = sm.transpose(2, 0, 4, 1, 3).reshape(2, rows, cols // GROUP)
-    qs = blk[..., _SM_BYTES:]
-    codes = np.empty(qs.shape[:-1] + (M_TILE * K_TILE,), np.uint8)
-    codes[..., 0::2] = qs & 0x0F
-    codes[..., 1::2] = qs >> 4
-    codes = codes.reshape(nb_r, nb_c, 2, K_TILE, 16).transpose(0, 2, 4, 1, 3)
-    return codes.reshape(rows, cols), sm[0], sm[1]
+    blk = blk.reshape(nb_r // 2, nb_c, 2, BLOCK_BYTES).swapaxes(1, 2)
+    codes, scales, mins = q4nx.unpack(blk.reshape(nb_r, nb_c, BLOCK_BYTES))
+    return (
+        codes.swapaxes(1, 2).reshape(rows, cols),
+        scales.swapaxes(1, 2).reshape(rows, cols // GROUP),
+        mins.swapaxes(1, 2).reshape(rows, cols // GROUP),
+    )
 
 
 def parse_bf16_blocked(proj_u8, offset, rows, cols):
@@ -410,20 +395,16 @@ def reference(geometry, layer_type, x, proj, rms, rope_rms, kv, context_len, max
 
 
 def pack_q4nx(codes, scales, mins):
-    """The proj bytes of a q4nx weight; the inverse of parse_q4nx."""
+    """The proj bytes of a q4nx weight; the inverse of parse_q4nx. The scales
+    and minima round to nearest bf16."""
     rows, cols = codes.shape
     nb_r, nb_c = rows // M_TILE, cols // K_TILE
-    sm = np.stack([scales, mins]).reshape(2, nb_r, M_TILE, nb_c, K_TILE // GROUP)
-    sm = sm.transpose(1, 3, 0, 4, 2).reshape(nb_r, nb_c, _SM_BYTES // 2)
-    sm = to_bf16(sm, "rne").view(np.uint8).reshape(nb_r, nb_c, _SM_BYTES)
-    c = (
-        codes.reshape(nb_r, 2, 16, nb_c, K_TILE)
-        .transpose(0, 3, 1, 4, 2)
-        .reshape(nb_r, nb_c, M_TILE * K_TILE)
-    )
-    qs = (c[..., 0::2] | (c[..., 1::2] << 4)).astype(np.uint8)
-    blk = np.concatenate([sm, qs], -1).reshape(nb_r // 2, 2, nb_c, BLOCK_BYTES)
-    return blk.transpose(0, 2, 1, 3).reshape(-1)
+
+    def blocks(a):
+        return a.reshape(nb_r, M_TILE, nb_c, -1).swapaxes(1, 2)
+
+    blk = q4nx.pack(blocks(codes), blocks(rb(scales, "rne")), blocks(rb(mins, "rne")))
+    return blk.reshape(nb_r // 2, 2, nb_c, BLOCK_BYTES).swapaxes(1, 2).reshape(-1)
 
 
 def pack_bf16_blocked(w):

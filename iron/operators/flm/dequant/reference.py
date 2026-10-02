@@ -15,18 +15,8 @@ from iron.operators.flm.dequant.design import (
     T,
     qw_bytes_for,
 )
-from iron.operators.flm.aie2p_math_emulation import f32_to_bf16_floor
-from iron.operators.flm.q4nx import (
-    BLOCK_BYTES,
-    GROUP,
-    K_TILE,
-    M_TILE,
-    bf16_to_f32,
-    packed_bytes,
-)
-
-# Out-features one run of code bytes spans.
-PARALLEL = 16
+from iron.operators.flm import q4nx
+from iron.operators.flm.q4nx import BLOCK_BYTES, GROUP, K_TILE, M_TILE, packed_bytes
 
 
 def _blocks(qw):
@@ -56,28 +46,9 @@ def _block_origins(n_blocks, K):
 def dequantize(qw, K, N):
     """q4nx blob to f32, shaped (N out-features, K in-features)."""
     b = _blocks(qw)
-    n_blocks = len(b)
-
-    n_groups = K_TILE // GROUP
-    sm = n_groups * M_TILE * 2
-    scales = bf16_to_f32(b[:, :sm].view(np.uint16).reshape(n_blocks, n_groups, M_TILE))
-    mins = bf16_to_f32(
-        b[:, sm : 2 * sm].view(np.uint16).reshape(n_blocks, n_groups, M_TILE)
-    )
-
-    qs = b[:, 2 * sm :].reshape(n_blocks, M_TILE // PARALLEL, K_TILE, PARALLEL // 2)
-    q = np.empty((n_blocks, M_TILE // PARALLEL, K_TILE, PARALLEL), dtype=np.float32)
-    q[..., 0::2] = (qs & 0xF).astype(np.float32)
-    q[..., 1::2] = (qs >> 4).astype(np.float32)
-    q = q.transpose(0, 1, 3, 2).reshape(n_blocks, M_TILE, K_TILE)
-
-    grp = np.arange(K_TILE) // GROUP
-    s = scales[:, grp, :].transpose(0, 2, 1)
-    m = mins[:, grp, :].transpose(0, 2, 1)
-    vals = m + s * q
-
+    vals = q4nx.dequantize(b)
     out = np.empty((N, K), dtype=np.float32)
-    for i, (r0, c0) in enumerate(_block_origins(n_blocks, K)):
+    for i, (r0, c0) in enumerate(_block_origins(len(b), K)):
         out[r0 : r0 + M_TILE, c0 : c0 + K_TILE] = vals[i]
     return out
 
@@ -118,22 +89,8 @@ def scatter_runs(qw, K, N, run_out_features, run_period_out_features, seed=0):
 
 
 def random_q4nx(K, N, seed=0):
-    """A random q4nx blob. Scales and mins are bf16 in the file, so they are
-    generated there and widened."""
-    rng = np.random.default_rng(seed)
+    """A random q4nx blob."""
     n_blocks = (K // K_TILE) * (N // M_TILE)
-    sm = (K_TILE // GROUP) * M_TILE
-
-    scales = f32_to_bf16_floor(
-        rng.uniform(0.002, 0.05, (n_blocks, sm)).astype(np.float32)
-    )
-    mins = f32_to_bf16_floor(rng.uniform(-0.4, 0.4, (n_blocks, sm)).astype(np.float32))
-    codes = rng.integers(0, 256, (n_blocks, M_TILE * K_TILE // 2), dtype=np.uint8)
-    return np.concatenate(
-        [
-            scales.view(np.uint8).reshape(n_blocks, -1),
-            mins.view(np.uint8).reshape(n_blocks, -1),
-            codes,
-        ],
-        axis=1,
-    ).ravel()
+    rng = np.random.default_rng(seed)
+    blocks = q4nx.random_blocks(rng, n_blocks, (0.002, 0.05), (-0.4, 0.4), "floor")
+    return blocks.ravel()
