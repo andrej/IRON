@@ -6,6 +6,7 @@
 import numpy as np
 
 from iron.operators.flm import q4nx
+from iron.operators.flm.kernel_constants import RMS_EPS
 from iron.operators.flm.q4nx import BLOCK_BYTES, K_TILE, M_TILE
 
 
@@ -26,7 +27,7 @@ def dequantize(w, dim, vocab, cols, rows):
     return out
 
 
-def reference(weights, x, softcap, eps=1e-6):
+def reference(weights, x, softcap, eps=RMS_EPS):
     """Softcapped logits of the RMS-normalized token.
 
     ``weights`` is the (vocab, dim) matrix from ``dequantize``. ``x`` has the
