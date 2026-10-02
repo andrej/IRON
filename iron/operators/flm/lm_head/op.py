@@ -4,10 +4,12 @@
 from dataclasses import dataclass, field
 
 import numpy as np
+import torch
 from ml_dtypes import bfloat16
 
 import aie.utils as aie_utils
 from aie.iron.kernels import flm_gemma4
+from aie.utils.verify import Tolerance
 
 from iron.common import (
     AIERuntimeArgSpec,
@@ -91,10 +93,42 @@ class LMHead(MLIROperator):
             AIERuntimeArgSpec("in", (2 * self.dim,), dtype=bfloat16),
         ]
 
-    def reference(self, w, x):
-        """CPU reference, in float64: the softcapped logits of X for W."""
+    def _logits(self, w, x, softcap):
+        """The float64 logits of X for W, softcapped at softcap."""
         from iron.operators.flm.lm_head.reference import dequantize, reference
 
         dev = aie_utils.get_current_device()
+        w, x = (_host(a) for a in (w, x))
         weights = dequantize(w, self.dim, self.vocab, dev.cols, len(dev.core_rows))
-        return reference(weights, np.asarray(x, np.float64), self.softcap)
+        return reference(weights, x.astype(np.float64), softcap)
+
+    def reference(self, w, x):
+        """CPU reference, in float64: the softcapped logits of X for W."""
+        return torch.from_numpy(self._logits(w, x, self.softcap))
+
+    def reference_tolerance(self, tanh_error=True):
+        """The error bound of README.md's Numerics section.
+
+        The largest logit before the softcap sets the projection's error.
+        The tanh approximation adds TANH_ERROR times the softcap. A test with
+        a softcap that keeps each tanh argument near zero checks the
+        projection alone with tanh_error=False.
+        """
+        from iron.operators.flm.lm_head.reference import PROJECTION_ERROR, TANH_ERROR
+
+        def bound(w, x):
+            uncapped = self._logits(w, x, 1e30)
+            limit = PROJECTION_ERROR * np.abs(uncapped).max()
+            if tanh_error:
+                limit += TANH_ERROR * self.softcap
+            return np.full(self.vocab, limit)
+
+        return Tolerance.bounded(bound, note="README.md's Numerics section")
+
+
+def _host(a):
+    """a as a numpy array. A bf16 torch tensor widens to float32, exactly."""
+    if isinstance(a, torch.Tensor):
+        a = a.detach().cpu()
+        return (a.float() if a.dtype == torch.bfloat16 else a).numpy()
+    return np.asarray(a)

@@ -4,24 +4,18 @@
 
 import numpy as np
 import pytest
+import torch
 from ml_dtypes import bfloat16
 
-import aie.utils as aie_utils
-from aie.utils.benchmark import run_iters
-
-from iron.operators.flm.lm_head.op import LMHead
-from iron.operators.flm.lm_head.reference import dequantize, reference
+from iron.common.test_utils import assert_matches_reference
 from iron.operators.flm import q4nx
+from iron.operators.flm.lm_head.op import LMHead
 from iron.operators.flm.q4nx import K_TILE, M_TILE
 from iron.operators.flm.testing import requires_aie2p
 
 # The initial value of y. No logit of the test inputs reaches it, so an
 # unwritten output fails the check.
 SENTINEL = 99.0
-
-# Error bounds from README.md's Numerics section.
-PROJECTION_ERROR = 0.025
-TANH_ERROR = 0.04
 
 GEMMA4_SOFTCAP = 30.0
 
@@ -45,47 +39,20 @@ def _inputs(dim, vocab, seed):
     return w, x.astype(bfloat16)
 
 
-def _print_metrics(op, run, bufs):
-    """Time one more dispatch and print its latency, bandwidth and throughput.
-
-    The bytes count the q4nx vocabulary, X and Y.
-    """
-    total_bytes = sum(b.numpy().nbytes for b in bufs)
-    flops = 2 * op.vocab * op.dim
-    latency_us = run_iters(run, *bufs, warmup=1, iters=1).npu.avg_us
-    print(f"\nLatency (us): {latency_us:.1f}")
-    print(f"Effective Bandwidth: {total_bytes / latency_us / 1e3:.6e} GB/s")
-    print(f"Throughput: {flops / latency_us / 1e3:.6e} GFLOP/s\n")
-
-
-def _check(dim, vocab, softcap, aie_context, seed=0, tanh_error=True, metrics=False):
-    """Compare the device's logits for seed's inputs with the reference."""
+def _check(dim, vocab, softcap, aie_context, seed=0, tanh_error=True):
+    """Compare the device's logits for seed's inputs with the reference.
+    Returns the logits."""
     op = LMHead(dim=dim, vocab=vocab, softcap=softcap, context=aie_context)
-    op.compile()
     w, x = _inputs(dim, vocab, seed)
-    run = op.get_callable()
-    bufs = (
-        aie_utils.full((vocab,), SENTINEL, dtype=bfloat16),
-        aie_utils.tensor(w.view(np.uint32)),
-        aie_utils.tensor(x),
+    got = assert_matches_reference(
+        op,
+        torch.from_numpy(w.view(np.uint32)),
+        torch.from_numpy(x.view(np.uint16)).view(torch.bfloat16),
+        tolerance=op.reference_tolerance(tanh_error=tanh_error),
+        output_fill=SENTINEL,
+        flops=2 * vocab * dim,
     )
-    run(*bufs)
-    got = bufs[0].numpy().astype(np.float64)
-    if metrics:
-        _print_metrics(op, run, bufs)
-    dev = aie_utils.get_current_device()
-    weights = dequantize(w, dim, vocab, dev.cols, len(dev.core_rows))
-    x64 = x.astype(np.float64)
-    expected = op.reference(w, x)
-    # The logits before the softcap set the projection's error scale.
-    uncapped = reference(weights, x64, 1e30)
-    bound = PROJECTION_ERROR * np.abs(uncapped).max()
-    if tanh_error:
-        bound += TANH_ERROR * softcap
-    error = np.abs(got - expected)
-    label = f"dim={dim} vocab={vocab} softcap={softcap}"
-    assert error.max() <= bound, f"{label}: max |error| {error.max():.3f} > {bound:.3f}"
-    return got
+    return got.astype(np.float64)
 
 
 @requires_aie2p
@@ -119,7 +86,7 @@ def test_softcap_bounds_the_logits(aie_context):
 @pytest.mark.parametrize("dim", [pytest.param(1536, marks=pytest.mark.bench), 2560])
 def test_gemma4_vocabulary(dim, aie_context):
     """Gemma 4's whole vocabulary of 262144 logits."""
-    _check(dim, 262144, GEMMA4_SOFTCAP, aie_context, seed=3, metrics=True)
+    _check(dim, 262144, GEMMA4_SOFTCAP, aie_context, seed=3)
 
 
 @requires_aie2p

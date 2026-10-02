@@ -9,6 +9,12 @@ from iron.operators.flm import q4nx
 from iron.operators.flm.kernel_constants import RMS_EPS
 from iron.operators.flm.q4nx import BLOCK_BYTES, K_TILE, M_TILE
 
+# The error bounds of README.md's Numerics section: a fraction of the
+# largest logit before the softcap, and the tanh approximation's absolute
+# error, which the softcap multiplies.
+PROJECTION_ERROR = 0.025
+TANH_ERROR = 0.04
+
 
 def dequantize(w, dim, vocab, cols, rows):
     """The whole q4nx vocabulary buffer to its (vocab, dim) weights.
