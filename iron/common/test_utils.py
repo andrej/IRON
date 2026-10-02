@@ -23,6 +23,8 @@ def verify_buffer(
     abs_tol: float = 1e-6,
     max_error_rate: float = 0.0,
     tolerance: Tolerance | None = None,
+    bound: np.ndarray | None = None,
+    fill=None,
 ) -> list[int]:
     """
     Verify buffer contents match reference within tolerances.
@@ -43,8 +45,11 @@ def verify_buffer(
         tolerance: A ``Tolerance`` to judge by instead of ``rel_tol``, ``abs_tol``
                    and ``max_error_rate``; typically the contract of the kernel
                    the operator runs (``ExternalFunction.contract.tolerance``).
-                   It must be judgeable element by element: no ``range_frac``
-                   and not a bound.
+                   It must be judgeable element by element: no ``range_frac``.
+        bound: The limit of each element's absolute error under a bound
+               ``tolerance``, evaluated on the reference's inputs
+        fill: The value the output held before the dispatch. An element that
+              still holds it fails, unless the reference holds it too.
 
     Returns:
         List of error indices. Empty if verification passes.
@@ -53,10 +58,14 @@ def verify_buffer(
         tolerance = Tolerance.relative(
             rel_tol, abs_tol, max_mismatch_frac=max_error_rate
         )
-    elif tolerance.kind == "bound" or tolerance.range_frac is not None:
+    elif tolerance.range_frac is not None:
         raise ValueError(
             f"{buf_name}: a {tolerance.kind} tolerance with range_frac="
             f"{tolerance.range_frac} depends on more than the element it judges"
+        )
+    if (tolerance.kind == "bound") != (bound is not None):
+        raise ValueError(
+            f"{buf_name}: pass bound= with a bound tolerance, and only with one"
         )
 
     def _to_numpy(x):
@@ -78,7 +87,19 @@ def verify_buffer(
         return list(range(len(output), len(expected_np)))
     output = output[: len(expected_np)]
 
-    verdict = compare(output, expected_np, tolerance)
+    unwritten = []
+    if fill is not None:
+        held = np.asarray(fill, output.dtype)
+        unwritten = np.flatnonzero(
+            (output == held) & (expected_np.astype(output.dtype) != held)
+        ).tolist()
+        if unwritten:
+            print(
+                f"{buf_name}: {len(unwritten)} elements still hold the fill value "
+                f"{fill}; first at index {unwritten[0]}"
+            )
+
+    verdict = compare(output, expected_np, tolerance, bound=bound)
     allowed = tolerance.max_mismatch_frac
     if verdict.n_mismatch and allowed > 0.0:
         within = "within" if verdict else "exceeds"
@@ -88,7 +109,7 @@ def verify_buffer(
             f"rate of {allowed * 100:.2f}%"
         )
     if verdict:
-        return []
+        return unwritten
 
     print(f"{buf_name}: {verdict.detail}")
     # compare() judges; it does not list the elements.
@@ -105,6 +126,13 @@ def verify_buffer(
     elif tolerance.kind == "exact":
         bad = output != expected_np.astype(output.dtype)
         error_indices = np.flatnonzero(bad & ~both_nan).tolist()
+    elif tolerance.kind == "bound":
+        limit = np.broadcast_to(np.asarray(bound, np.float64), expected_np.shape)
+        error = np.abs(
+            output.astype(np.float64)
+            - expected_np.astype(np.float32).astype(np.float64)
+        )
+        error_indices = np.flatnonzero(~(error <= limit) & ~both_nan).tolist()
     else:
         each = replace(tolerance, max_mismatch_frac=0.0)
         error_indices = [
@@ -116,7 +144,7 @@ def verify_buffer(
         print(
             f"Mismatch in {buf_name}[{i}]: expected {float(expected_np[i]):.6f}, got {float(output[i]):.6f}"
         )
-    return error_indices
+    return sorted(set(error_indices) | set(unwritten))
 
 
 def _nbytes(buf) -> int:
@@ -140,6 +168,9 @@ def run_test(
     warmup_iters: int = 1,
     timed_iters: int = 1,
     tolerance: Tolerance | None = None,
+    bounds: dict[str, np.ndarray] | None = None,
+    output_fill=None,
+    outputs: dict[str, np.ndarray] | None = None,
 ) -> tuple[dict[str, list[int]], float, float]:
     """
     Run operator test with specified input/output buffers.
@@ -155,6 +186,11 @@ def run_test(
         timed_iters: Number of timed iterations for latency/bandwidth measurement
         tolerance: Judge the outputs by this ``Tolerance`` instead; see
                    ``verify_buffer``
+        bounds: Each output's per-element error limit under a bound
+                ``tolerance``, by buffer name
+        output_fill: Fill the ``"out"`` buffers with this value before the
+                     dispatch. An output element that still holds it fails.
+        outputs: A dict that receives a copy of each output buffer, by name
 
     Returns:
         (errors: dict, latency_us: float, bandwidth_gbps: float)
@@ -196,7 +232,10 @@ def run_test(
                 name, expected = next(output_iter)
             except StopIteration:
                 raise ValueError("Not enough output buffers provided for arg spec")
-            buf = tensor_class(spec.shape, dtype=spec.dtype)
+            if output_fill is None:
+                buf = tensor_class(spec.shape, dtype=spec.dtype)
+            else:
+                buf = tensor_class.full(spec.shape, output_fill, dtype=spec.dtype)
             args.append(buf)
             output_map[name] = buf
             total_bytes += _nbytes(buf)
@@ -226,6 +265,8 @@ def run_test(
         if buf_name in output_map:
             buf = output_map[buf_name]
             output_torch = buf.to_torch()
+            if outputs is not None:
+                outputs[buf_name] = buf.numpy().copy()
             buf_errors = verify_buffer(
                 output_torch,
                 buf_name,
@@ -234,6 +275,8 @@ def run_test(
                 abs_tol,
                 max_error_rate,
                 tolerance=tolerance,
+                bound=(bounds or {}).get(buf_name),
+                fill=output_fill if buf_name not in inout_names else None,
             )
             if buf_errors:
                 errors[buf_name] = buf_errors
@@ -252,7 +295,9 @@ def assert_matches_reference(
     operator: AIEOperatorBase,
     *inputs: torch.Tensor,
     tolerance: Tolerance | None = None,
-) -> None:
+    output_fill=None,
+    flops: int | None = None,
+) -> np.ndarray:
     """Dispatch ``operator`` once and assert its output matches ``reference()``.
 
     The expected output is ``operator.reference(*inputs)``, each input shaped
@@ -265,7 +310,15 @@ def assert_matches_reference(
         inputs: Its ``"in"`` arguments, in argument-spec order
         tolerance: How close the output must come; defaults to
                    ``operator.reference_tolerance()``, the contract of the
-                   kernel it runs
+                   kernel it runs. A bound tolerance's bound takes the same
+                   arguments as ``reference()``.
+        output_fill: The value the output holds before the dispatch; see
+                     ``run_test``
+        flops: The operations of one dispatch. The test then also prints the
+               throughput.
+
+    Returns:
+        The output buffer as the operator left it
     """
     in_specs = [s for s in operator.get_arg_spec() if s.direction == "in"]
     if len(inputs) != len(in_specs):
@@ -273,27 +326,37 @@ def assert_matches_reference(
             f"{type(operator).__name__} takes {len(in_specs)} inputs, "
             f"got {len(inputs)}"
         )
-    expected = operator.reference(
-        *(x.reshape(spec.shape) for x, spec in zip(inputs, in_specs))
-    )
+    shaped = [x.reshape(spec.shape) for x, spec in zip(inputs, in_specs)]
+    expected = operator.reference(*shaped)
     if tolerance is None:
         tolerance = operator.reference_tolerance()
     if tolerance is None:
         raise ValueError(
             f"{type(operator).__name__} declares no tolerance; pass tolerance="
         )
+    bounds = None
+    if tolerance.kind == "bound":
+        bounds = {"output": tolerance.bound(*shaped)}
 
+    outputs = {}
     errors, latency_us, bandwidth_gbps = run_test(
         operator,
         {f"input{i}": x for i, x in enumerate(inputs)},
         {"output": expected},
         tolerance=tolerance,
+        bounds=bounds,
+        output_fill=output_fill,
+        outputs=outputs,
     )
 
     print(f"\nLatency (us): {latency_us:.1f}")
-    print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s\n")
+    print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s")
+    if flops is not None:
+        print(f"Throughput: {flops / latency_us / 1e3:.6e} GFLOP/s")
+    print()
 
     assert not errors, f"Test failed with errors: {errors}"
+    return outputs["output"]
 
 
 # A dispatch costs about 160 us, so a shape that runs inside that measures the
