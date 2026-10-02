@@ -81,6 +81,10 @@ The attention matmuls run on bfp16 operands.
 `max_l` sets where V starts in a global layer's cache. A sliding-window
 layer's cache is a ring of 512 rows.
 
+`set_parameters()` raises a `ValueError` unless `0 < max_l <= 32768` and
+`context_len >= 0`. A `global` or `global_skip` layer also requires
+`context_len < max_l`.
+
 ## Buffers
 
 The design expects these buffers, in this order. The argument spec gives

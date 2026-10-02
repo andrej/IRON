@@ -28,6 +28,7 @@ from aie.utils.npukernel import NPUKernel
 from iron.common.base import DispatchCallable
 from iron.operators.flm.layer.design import (
     LAYER_TYPES,
+    MAX_CONTEXT,
     RTP_ADDRESSES,
     RTP_SYMBOLS,
     SLIDING_WINDOW,
@@ -108,7 +109,8 @@ def _dispatch(ops, layer_type, bufs, context_len, max_l):
             kernel_name=xclbin.kernel_name,
             dispatch_params=list(op.get_dispatch_params()),
             dispatch_lib_path=Path(op.dispatch_artifact.filename).resolve(),
-        )
+        ),
+        validate=op.validate_dispatch_params,
     )
     run.set_parameters(context_len=context_len, max_l=max_l)
     run(*bufs)
@@ -351,3 +353,36 @@ def test_weight_reads_fit_proj(geometry, layer_type, npu2):
 def test_rejects_unknown_configurations(kwargs, match, aie_context):
     with pytest.raises(ValueError, match=match):
         DecodeLayer(context=aie_context, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "layer_type, context_len, max_l, match",
+    [
+        ("global", -1, MAX_L, "context_len"),
+        ("global", MAX_L, MAX_L, "< max_l"),
+        ("global_skip", MAX_L, MAX_L, "< max_l"),
+        ("global", 0, 0, "max_l"),
+        ("global", 0, MAX_CONTEXT + 1, "max_l"),
+        ("swa", -1, MAX_L, "context_len"),
+        ("swa", 0, MAX_CONTEXT + 1, "max_l"),
+        ("swa_skip", 2**31 - 1, MAX_L, "context_len"),
+    ],
+)
+def test_rejects_dispatch_params_outside_the_design(
+    layer_type, context_len, max_l, match, npu2
+):
+    """set_parameters() calls this check. It needs no build."""
+    op = DecodeLayer(geometry=FLM_GEMMA4_E2B_DECODE, layer_type=layer_type)
+    with pytest.raises(ValueError, match=match):
+        op.validate_dispatch_params(context_len=context_len, max_l=max_l)
+
+
+@pytest.mark.parametrize("layer_type", LAYER_TYPES)
+def test_accepts_the_tested_and_the_engine_dispatch_params(layer_type, npu2):
+    """The engine's max_l is a power of two from 4096 to MAX_CONTEXT."""
+    op = DecodeLayer(geometry=FLM_GEMMA4_E2B_DECODE, layer_type=layer_type)
+    for context_len in CONTEXT_LENS[layer_type]:
+        op.validate_dispatch_params(context_len=context_len, max_l=MAX_L)
+    for context_len in (0, 4095, MAX_CONTEXT - 1):
+        op.validate_dispatch_params(context_len=context_len, max_l=MAX_CONTEXT)
+    op.validate_dispatch_params(context_len=4095, max_l=4096)
