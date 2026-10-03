@@ -16,6 +16,8 @@ import numpy as np
 
 from iron.operators.flm.aie2p_math_emulation import bf16_to_f32, to_bf16
 
+# Replaced by aie.iron.kernels.quant.Q4NX_M_TILE, Q4NX_K_TILE, Q4NX_GROUP and
+# Q4NX_BLOCK_BYTES at the next wheel bump.
 M_TILE, K_TILE, GROUP = 32, 256, 32
 
 BITS_PER_WEIGHT = 4 + 2 * 16 // GROUP
@@ -32,6 +34,7 @@ def packed_bytes(n_weights: int) -> int:
     return n_weights * BITS_PER_WEIGHT // 8
 
 
+# Replaced by aie.iron.kernels.quant.q4nx_unpack at the next wheel bump.
 def unpack(blocks):
     """Blocks ``(..., BLOCK_BYTES)`` to ``(codes, scales, mins)``.
 
