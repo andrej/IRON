@@ -29,6 +29,7 @@ def bf16_to_f32(u16):
     return (np.asarray(u16).astype(np.uint32) << 16).view(np.float32)
 
 
+# Replaced by aie.utils.aie2p_emulation.bf16_floor_bits at the next wheel bump.
 def f32_to_bf16_floor(x):
     """Round f32 to bf16 toward negative infinity, as the cores do."""
     u = np.ascontiguousarray(x, dtype=np.float32).view(np.uint32)
@@ -37,11 +38,13 @@ def f32_to_bf16_floor(x):
     return ((u >> 16) + (inexact & negative)).astype(np.uint16)
 
 
+# Replaced by aie.utils.aie2p_emulation.f32 at the next wheel bump.
 def f32(x):
     """x rounded to fp32."""
     return np.asarray(x, np.float64).astype(np.float32)
 
 
+# Replaced by aie.utils.aie2p_emulation.round_bf16_bits at the next wheel bump.
 def to_bf16(x, rounding="floor"):
     """float -> bf16 bit patterns. rounding is "floor" (the device) or "rne"."""
     if rounding == "rne":
@@ -49,11 +52,13 @@ def to_bf16(x, rounding="floor"):
     return f32_to_bf16_floor(f32(x))
 
 
+# Replaced by aie.utils.aie2p_emulation.round_bf16 at the next wheel bump.
 def rb(x, rounding="floor"):
     """x rounded to a bf16 value."""
     return bf16_to_f32(to_bf16(x, rounding))
 
 
+# Replaced by aie.utils.aie2p_emulation.fmul at the next wheel bump.
 def fmul(a, b):
     """An fp32 product as AIE2P computes it.
 
@@ -88,6 +93,7 @@ def fmul(a, b):
     return acc
 
 
+# Replaced by aie.utils.aie2p_emulation.tree_sum at the next wheel bump.
 def tree_sum(x, lanes):
     """fp32 sum over the last axis as an accumulator of `lanes` lanes computes
     it: running sums per lane, then a pairwise halving of the lanes."""
@@ -112,6 +118,7 @@ def bfp16(x, axis):
     return np.moveaxis(bfp.quantize(x, rounding="floor").astype(np.float64), -1, axis)
 
 
+# Replaced by aie.utils.aie2p_emulation.fast_rsqrt at the next wheel bump.
 def fast_rsqrt(s):
     """1 / sqrt(s) in fp32: a 0x5f3759df seed, then two Newton steps."""
     s = f32(s)
@@ -127,9 +134,11 @@ def fast_rsqrt(s):
 
 
 # The mantissa of 1 / (1 + m / 128), in 7 bits.
+# Replaced by aie.utils.aie2p_emulation.INV_MANTISSA at the next wheel bump.
 INV_MANTISSA = np.round(256 / (1 + np.arange(128) / 128)).astype(np.uint32) & 0x7F
 
 
+# Replaced by aie.utils.aie2p_emulation.inv_bf16 at the next wheel bump.
 def inv_kernel(l):
     """getInvBf16: 1 / l as bf16, from the exponent and INV_MANTISSA. The
     relative error is up to 0.4%."""
@@ -142,6 +151,7 @@ def inv_kernel(l):
     )
 
 
+# Replaced by aie.utils.aie2p_emulation.gelu_lut_segments at the next wheel bump.
 @cache
 def gelu_segments():
     """getGeluBf16's table: 64 (slope, offset) segments of width 1/8 on [-4, 4).
@@ -156,6 +166,7 @@ def gelu_segments():
     return np.array(values, np.float32).reshape(-1, 2, 8)[:, 0].reshape(-1, 2)
 
 
+# Replaced by aie.utils.aie2p_emulation.gelu_bf16 at the next wheel bump.
 def gelu_kernel(x):
     """getGeluBf16: GELU from gelu_segments. The device reads the slope as bf16
     and the offset as fp32. Inputs outside [-4, 4) take the end segments."""
