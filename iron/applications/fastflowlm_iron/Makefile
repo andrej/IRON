@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-FLM_REPO   := https://github.com/ROCm/FastFlowLM.git
-FLM_COMMIT := 69f691b58c30effdd29fa263839054b545d8ecc7
+FLM_REPO   := https://github.com/andrej/FastFlowLM.git
+FLM_COMMIT := 688a15f67aa5b300278a55ffe13ab44be49c9d1d
 BUILD      := $(CURDIR)/build
 FLM_ROOT   := $(BUILD)/FastFlowLM
 

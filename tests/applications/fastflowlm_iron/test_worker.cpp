@@ -98,8 +98,10 @@ int ServeFake()
                 send({{"ok", false}, {"error", "Unsupported task"}, {"invalid_argument", true}});
                 continue;
             }
-            const float values[] = {static_cast<float>(options.at("input").get<std::string>().size()),
-                                    options.value("dimensions", 768.0f)};
+            const auto &input = options.at("input");
+            const float values[] = {
+                static_cast<float>((input.is_object() ? input.at("text") : input).get<std::string>().size()),
+                options.value("dimensions", 768.0f)};
             send({{"ok", true}, {"count", 2}, {"prompt_tokens", 9}}, values, sizeof(values));
         } else {
             TEST_REQUIRE(name == "reset" || name == "close");

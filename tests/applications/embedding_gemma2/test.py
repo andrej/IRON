@@ -208,16 +208,22 @@ def test_embedding_request():
         encode=lambda tokens, dims: (bytes(tokens).decode(), dims),
     )
     request = {
-        "input": "hello",
+        "input": {"text": "hello", "title": "World"},
         "task": "document",
-        "title": "World",
         "dimensions": 128,
     }
     vector, count = EmbeddingGemma.embed_request(model, request)
     assert vector == ("title: World | text: hello", 128)
     assert count == len(vector[0])
+    default, _ = EmbeddingGemma.embed_request(model, {"input": "hello"})
+    assert default == ("task: search result | query: hello", 768)
+    no_title, _ = EmbeddingGemma.embed_request(
+        model, {"input": {"text": "hello", "title": None}, "task": "document"}
+    )
+    assert no_title == ("title: none | text: hello", 768)
     for field, value in (
-        ("title", 7),
+        ("input", {"text": "hello", "title": 7}),
+        ("input", {"text": "hello", "unknown": True}),
         ("dimensions", 0),
         ("dimensions", 128.0),
         ("dimensions", True),

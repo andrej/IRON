@@ -320,7 +320,10 @@ def test_model(tmp_path, installation, tag, name):
                     "dimensions": 128,
                 }
                 plain = post(url, "/v1/embeddings", document)
-                document["title"] = "Cities of Europe"
+                document["input"] = {
+                    "text": document["input"],
+                    "title": "Cities of Europe",
+                }
                 titled = post(url, "/v1/embeddings", document)
                 vector = np.asarray(titled["data"][0]["embedding"])
                 assert vector.shape == (128,) and np.isfinite(vector).all()
