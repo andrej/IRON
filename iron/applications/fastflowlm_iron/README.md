@@ -53,8 +53,9 @@ are already present.
 ## Embedding requests
 
 `embeddinggemma-2:740m` accepts a string `input` or an object with `text` and
-optional `title`, or a batch of either. Omitting `task` selects query. An object
-can supply a title for document tasks; an omitted or null title uses `none`.
+optional `task` and `title`, or a batch of either. A string input, or an omitted,
+null or empty `input.task`, selects query. An object can supply a title for
+document tasks; an omitted or null title uses `none`.
 `dimensions` is outside `input` and accepts 768 (default), 512, 256, or 128;
 each output is normalized. IRON formats and tokenizes the input, and reports
 processed tokens including prefixes and special tokens. Unsupported input
@@ -78,7 +79,7 @@ For example, `Reranking` uses the query prompt; embed candidate documents with
 `document`. Other models can define different tasks and options.
 
 ```json
-{"model":"embeddinggemma-2:740m","input":{"text":"Paris is in France.","title":"France"},"task":"document","dimensions":128}
+{"model":"embeddinggemma-2:740m","input":{"text":"Paris is in France.","title":"France","task":"document"},"dimensions":128}
 ```
 
 To keep chat and embedding engines loaded in the same server:

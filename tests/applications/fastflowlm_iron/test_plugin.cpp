@@ -90,12 +90,13 @@ void test_plugin()
     TEST_REQUIRE(emb.load(emb.object, &extended.context, nullptr) == 0);
     flm_embedding_result_v1 vector{};
     vector.struct_size = sizeof(vector);
-    TEST_REQUIRE(emb.embed(emb.object, Span(R"({"input":"hello","task":"unknown"})"), nullptr, &vector, nullptr) ==
-                 FLM_MODEL_EXTENSION_STATUS_INVALID_ARGUMENT);
+    TEST_REQUIRE(
+        emb.embed(emb.object, Span(R"({"input":{"text":"hello","task":"unknown"}})"), nullptr, &vector, nullptr) ==
+        FLM_MODEL_EXTENSION_STATUS_INVALID_ARGUMENT);
     TEST_REQUIRE(emb.embed(emb.object, Span(R"({"input":"hello"})"), nullptr, &vector, nullptr) == 0);
     TEST_REQUIRE(vector.size == 2 && vector.data[0] == 5 && vector.data[1] == 768);
     TEST_REQUIRE(emb.embed(emb.object,
-                           Span(R"({"input":{"text":"hello","title":"France"},"task":"document","dimensions":128})"),
+                           Span(R"({"input":{"text":"hello","title":"France","task":"document"},"dimensions":128})"),
                            nullptr,
                            &vector,
                            nullptr) == 0);

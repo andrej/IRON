@@ -411,21 +411,24 @@ class EmbeddingGemma(Encoder):
     def embed_request(self, request: dict) -> tuple[np.ndarray, int]:
         """Embed one text request with optional task, document title and dimensions.
 
-        Input is a string or an object with ``text`` and optional ``title``.
-        Task names are ``TextProcessor.TASKS``; omitted tasks select query.
+        Input is a string or an object with ``text``, optional ``task`` and ``title``.
+        Task names are ``TextProcessor.TASKS``; omitted or null tasks select query.
         Return the vector and number of processed tokens, including the prompt.
         """
         if not isinstance(request, dict):
             raise ValueError("Embedding request must be an object")
-        unknown = request.keys() - {"input", "task", "dimensions"}
+        unknown = request.keys() - {"input", "dimensions"}
         if unknown:
             raise ValueError(f"Unsupported embedding options: {sorted(unknown)}")
-        content, task = request.get("input"), request.get("task", "")
+        content, task = request.get("input"), ""
         title, dims = None, request.get("dimensions", 768)
         if isinstance(content, dict):
-            if content.keys() - {"text", "title"}:
-                raise ValueError("Input supports only text and title")
+            if content.keys() - {"text", "task", "title"}:
+                raise ValueError("Input supports only text, task and title")
             text, title = content.get("text"), content.get("title")
+            task = content.get("task")
+            if task is None:
+                task = ""
         else:
             text = content
         if not isinstance(text, str) or not isinstance(task, str):
